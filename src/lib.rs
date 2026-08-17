@@ -6,6 +6,10 @@ pub mod aws;
 #[cfg(feature = "mock")]
 pub mod mock;
 
+// Only compiled when there is a backend to run it against.
+#[cfg(all(test, any(feature = "mock", feature = "dynamodb-local-tests")))]
+mod conformance;
+
 /// The key attribute names of an index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySchema {
@@ -21,6 +25,31 @@ pub struct KeySchema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrimaryIndex {
     pub keys: KeySchema,
+}
+
+#[cfg(any(feature = "aws", feature = "mock"))]
+impl PrimaryIndex {
+    /// Resolves a caller-supplied `sk` against this schema, returning the sort key's attribute
+    /// name paired with the value when the table has one.
+    ///
+    /// `Err` if `sk` doesn't match whether the table actually has a sort key. Every
+    /// [`AwsDynamoDbService`] implementation routes its key handling through here so the
+    /// backends agree on what a well-formed key is.
+    pub(crate) fn resolve_sk<'a>(
+        &'a self,
+        sk: &Option<String>,
+    ) -> Result<Option<(&'a str, String)>, String> {
+        match (self.keys.sk_identifier.as_deref(), sk) {
+            (Some(sk_identifier), Some(sk)) => Ok(Some((sk_identifier, sk.clone()))),
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                Err("PrimaryIndex has a sort key, but none was provided".to_string())
+            }
+            (None, Some(_)) => {
+                Err("a sort key was provided, but PrimaryIndex has none".to_string())
+            }
+        }
+    }
 }
 
 /// A Global Secondary Index.

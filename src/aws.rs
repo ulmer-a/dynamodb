@@ -41,16 +41,7 @@ impl AwsDynamoDb {
     /// attribute name paired with the value when the table has one. `Err` if `sk` doesn't
     /// match whether the table actually has a sort key.
     fn resolve_sk(&self, sk: &Option<String>) -> Result<Option<(&str, String)>, String> {
-        match (self.primary_index.keys.sk_identifier.as_deref(), sk) {
-            (Some(sk_identifier), Some(sk)) => Ok(Some((sk_identifier, sk.clone()))),
-            (None, None) => Ok(None),
-            (Some(_), None) => {
-                Err("PrimaryIndex has a sort key, but none was provided".to_string())
-            }
-            (None, Some(_)) => {
-                Err("a sort key was provided, but PrimaryIndex has none".to_string())
-            }
-        }
+        self.primary_index.resolve_sk(sk)
     }
 }
 

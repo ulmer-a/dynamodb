@@ -12,6 +12,10 @@ license = "MIT OR Apache-2.0"
 default = [ "mock", "aws" ]
 mock = []
 aws = [ "dep:aws-sdk-dynamodb", "dep:aws-config", "dep:serde_dynamo" ]
+# Runs the conformance suite against a DynamoDB Local instance in addition to the mock. Needs a
+# server on http://localhost:8000 (override with DYNAMODB_LOCAL_ENDPOINT); see
+# src/conformance/local.rs.
+dynamodb-local-tests = [ "aws" ]
 
 [dependencies]
 async-trait = "0.1.86"
