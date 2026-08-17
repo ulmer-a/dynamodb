@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{AnyIndex, AwsDynamoDbService, PrimaryIndex, SortKeyCondition};
+use crate::{AnyIndex, AwsDynamoDbService, Error, PrimaryIndex, SortKeyCondition};
 
 /// In-memory [`AwsDynamoDbService`] implementation for local running and unit testing.
 ///
@@ -51,17 +51,17 @@ impl MockDynamoDb {
         table: &str,
         data_version: u64,
         payload: &T,
-    ) -> Result<(), String>
+    ) -> Result<(), Error>
     where
         T: Serialize,
     {
         self.primary_index.resolve_sk(&sk)?;
 
         let value = serde_json::to_value(payload)
-            .map_err(|e| format!("Failed to serialize mock payload: {e}"))?;
+            .map_err(|e| Error::Serialization(format!("Failed to serialize mock payload: {e}")))?;
         self.items
             .lock()
-            .map_err(|e| format!("mock store lock poisoned: {e}"))?
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?
             .insert(
                 MockDbKey {
                     table_name: table.to_string(),
@@ -81,7 +81,7 @@ impl AwsDynamoDbService for MockDynamoDb {
         pk: String,
         sk: Option<String>,
         table: &str,
-    ) -> Result<Option<(u64, T)>, String>
+    ) -> Result<Option<(u64, T)>, Error>
     where
         T: DeserializeOwned + Send,
     {
@@ -90,7 +90,7 @@ impl AwsDynamoDbService for MockDynamoDb {
         let guard = self
             .items
             .lock()
-            .map_err(|e| format!("mock store lock poisoned: {e}"))?;
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?;
 
         let mock_key = MockDbKey {
             table_name: table.to_string(),
@@ -101,7 +101,9 @@ impl AwsDynamoDbService for MockDynamoDb {
         match guard.get(&mock_key) {
             Some((data_version, value)) => {
                 let payload: T = serde_json::from_value(value.clone()).map_err(|e| {
-                    format!("Failed to deserialize mock item for pk={pk}, sk={sk:?}: {e}")
+                    Error::Serialization(format!(
+                        "Failed to deserialize mock item for pk={pk}, sk={sk:?}: {e}"
+                    ))
                 })?;
                 Ok(Some((*data_version, payload)))
             }
@@ -115,19 +117,19 @@ impl AwsDynamoDbService for MockDynamoDb {
         sk: Option<String>,
         table: &str,
         payload: &T,
-    ) -> Result<(), String>
+    ) -> Result<(), Error>
     where
         T: Serialize + Send + Sync,
     {
         self.primary_index.resolve_sk(&sk)?;
 
         let value = serde_json::to_value(payload)
-            .map_err(|e| format!("Failed to serialize mock payload: {e}"))?;
+            .map_err(|e| Error::Serialization(format!("Failed to serialize mock payload: {e}")))?;
 
         // Last-writer-wins: overwrite any existing item and reset the version to 1.
         self.items
             .lock()
-            .map_err(|e| format!("mock store lock poisoned: {e}"))?
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?
             .insert(
                 MockDbKey {
                     table_name: table.to_string(),
@@ -146,25 +148,23 @@ impl AwsDynamoDbService for MockDynamoDb {
         table: &str,
         expected_version: u64,
         payload: &T,
-    ) -> Result<u64, String>
+    ) -> Result<u64, Error>
     where
         T: Serialize + Send + Sync,
     {
         if expected_version == 0 {
-            return Err(
-                "put_item() does not accept version=0. Use put_item_unconditional()".to_string(),
-            );
+            return Err(Error::zero_expected_version());
         }
 
         self.primary_index.resolve_sk(&sk)?;
 
         let value = serde_json::to_value(payload)
-            .map_err(|e| format!("Failed to serialize mock payload: {e}"))?;
+            .map_err(|e| Error::Serialization(format!("Failed to serialize mock payload: {e}")))?;
 
         let mut guard = self
             .items
             .lock()
-            .map_err(|e| format!("mock store lock poisoned: {e}"))?;
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?;
 
         let map_key = MockDbKey {
             table_name: table.to_string(),
@@ -176,9 +176,11 @@ impl AwsDynamoDbService for MockDynamoDb {
         // Optimistic concurrency: the stored version (or its absence) must match what the
         // caller expects, otherwise a concurrent writer has changed the item.
         if current_version != Some(expected_version) {
-            return Err(format!(
-                "Optimistic concurrency conflict for pk={pk}, sk={sk:?}: expected version {expected_version}, found {current_version:?}"
-            ));
+            return Err(Error::Conflict {
+                pk,
+                sk,
+                expected_version,
+            });
         }
 
         let new_version = expected_version + 1;
@@ -192,16 +194,14 @@ impl AwsDynamoDbService for MockDynamoDb {
         pk: String,
         sk_condition: Option<SortKeyCondition>,
         table: &str,
-    ) -> Result<Vec<(u64, T)>, String>
+    ) -> Result<Vec<(u64, T)>, Error>
     where
         T: DeserializeOwned + Send,
     {
         let index = index.into();
 
         if sk_condition.is_some() && index.sk_identifier().is_none() {
-            return Err(
-                "a sort key condition was provided but the index has no sort key".to_string(),
-            );
+            return Err(Error::sk_condition_without_sort_key());
         }
         if let Some(condition) = &sk_condition
             && !matches!(
@@ -209,15 +209,15 @@ impl AwsDynamoDbService for MockDynamoDb {
                 SortKeyCondition::Prefix(_) | SortKeyCondition::Between(_, _)
             )
         {
-            return Err(format!(
+            return Err(Error::Unsupported(format!(
                 "{condition:?} is not yet implemented by MockDynamoDb"
-            ));
+            )));
         }
 
         let guard = self
             .items
             .lock()
-            .map_err(|e| format!("mock store lock poisoned: {e}"))?;
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?;
 
         let mut matches: Vec<(String, u64, T)> = Vec::new();
 
@@ -273,8 +273,9 @@ impl AwsDynamoDbService for MockDynamoDb {
                 }
             }
 
-            let payload: T = serde_json::from_value(value.clone())
-                .map_err(|e| format!("Failed to deserialize mock item for pk={pk}: {e}"))?;
+            let payload: T = serde_json::from_value(value.clone()).map_err(|e| {
+                Error::Serialization(format!("Failed to deserialize mock item for pk={pk}: {e}"))
+            })?;
             matches.push((item_sk.unwrap_or_default(), *data_version, payload));
         }
 
@@ -287,13 +288,13 @@ impl AwsDynamoDbService for MockDynamoDb {
             .collect())
     }
 
-    async fn delete_item(&self, pk: String, sk: Option<String>, table: &str) -> Result<(), String> {
+    async fn delete_item(&self, pk: String, sk: Option<String>, table: &str) -> Result<(), Error> {
         self.primary_index.resolve_sk(&sk)?;
 
         // DynamoDB DeleteItem is idempotent, so removing a missing key is a no-op success.
         self.items
             .lock()
-            .map_err(|e| format!("mock store lock poisoned: {e}"))?
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?
             .remove(&MockDbKey {
                 table_name: table.to_string(),
                 pk,
@@ -399,7 +400,7 @@ mod tests {
             .put_item(pk, sk, "BaluCoreTable", 0, &payload)
             .await
             .unwrap_err();
-        assert!(err.contains("does not accept version=0"), "{err}");
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -414,6 +415,10 @@ mod tests {
             .insert("device#1".to_string(), None, "BaluCoreTable", 1, &payload)
             .unwrap_err();
 
-        assert!(err.contains("PrimaryIndex has a sort key"), "{err}");
+        assert!(
+            matches!(&err, Error::InvalidRequest(message)
+                if message.contains("PrimaryIndex has a sort key")),
+            "{err:?}"
+        );
     }
 }

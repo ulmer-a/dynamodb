@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "aws")]
@@ -9,6 +11,103 @@ pub mod mock;
 // Only compiled when there is a backend to run it against.
 #[cfg(all(test, any(feature = "mock", feature = "dynamodb-local-tests")))]
 mod conformance;
+
+/// Everything an [`AwsDynamoDbService`] operation can fail with.
+///
+/// The distinction that matters to most callers is [`Error::Conflict`] — a lost race that the
+/// caller should retry — versus everything else, which signals a bug or an outage. Before this
+/// type existed every failure was a `String` and telling those apart meant substring-matching
+/// `"Optimistic concurrency conflict"`.
+///
+/// Marked `#[non_exhaustive]`: match with a wildcard arm, so that new variants (starting with
+/// the "already exists" outcome a future `create_item` needs) don't break you.
+///
+/// The variants that carry a `String` have already had their context formatted in. Backends
+/// erase their underlying error types into that string rather than keeping them as a
+/// [`std::error::Error::source`], so no `source` is available to walk.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Error {
+    /// An optimistic-concurrency check failed: the item's stored `data_version` was not
+    /// `expected_version`, so a concurrent writer got there first and nothing was written.
+    ///
+    /// Also what [`AwsDynamoDbService::put_item`] returns for an item that does not exist,
+    /// since its condition compares an attribute of an existing item and there is no way to
+    /// tell the two cases apart from the backend's response.
+    ///
+    /// Deliberately does not report the version actually found: DynamoDB's failed conditional
+    /// check doesn't reveal it, so a field for it could not be filled in consistently across
+    /// backends.
+    Conflict {
+        pk: String,
+        sk: Option<String>,
+        expected_version: u64,
+    },
+
+    /// The call was rejected before it reached the backend, because the arguments contradict
+    /// the configured schema or the operation's contract — an `sk` that disagrees with the
+    /// [`PrimaryIndex`], an `expected_version` of `0`, a sort key condition against an index
+    /// that has no sort key.
+    ///
+    /// Always a caller bug: retrying unchanged will fail the same way.
+    InvalidRequest(String),
+
+    /// The operation is meaningful but this backend hasn't implemented it yet — currently the
+    /// [`SortKeyCondition`] variants that aren't wired up.
+    Unsupported(String),
+
+    /// A payload could not be serialized into, or deserialized out of, its stored
+    /// representation. Usually means the stored item no longer matches the `T` being read.
+    Serialization(String),
+
+    /// The backend itself failed: transport error, throttling, an unexpected service response.
+    /// The one variant that may be worth retrying blindly.
+    Service(String),
+}
+
+impl Error {
+    /// Rejects `expected_version == 0`, which is reserved.
+    ///
+    /// Shared so the two backends can't drift on the wording of a check they both perform.
+    #[cfg(any(feature = "aws", feature = "mock"))]
+    pub(crate) fn zero_expected_version() -> Self {
+        Error::InvalidRequest(
+            "put_item() does not accept version=0. Use put_item_unconditional()".to_string(),
+        )
+    }
+
+    /// Rejects a [`SortKeyCondition`] against an index that has no sort key. Shared for the same
+    /// reason as [`Error::zero_expected_version`].
+    #[cfg(any(feature = "aws", feature = "mock"))]
+    pub(crate) fn sk_condition_without_sort_key() -> Self {
+        Error::InvalidRequest(
+            "a sort key condition was provided but the index has no sort key".to_string(),
+        )
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Formatted here rather than at each call site so every backend words a conflict
+            // identically.
+            Error::Conflict {
+                pk,
+                sk,
+                expected_version,
+            } => write!(
+                f,
+                "Optimistic concurrency conflict for pk={pk}, sk={sk:?}: expected version {expected_version}"
+            ),
+            Error::InvalidRequest(message)
+            | Error::Unsupported(message)
+            | Error::Serialization(message)
+            | Error::Service(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// The key attribute names of an index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,22 +131,22 @@ impl PrimaryIndex {
     /// Resolves a caller-supplied `sk` against this schema, returning the sort key's attribute
     /// name paired with the value when the table has one.
     ///
-    /// `Err` if `sk` doesn't match whether the table actually has a sort key. Every
-    /// [`AwsDynamoDbService`] implementation routes its key handling through here so the
-    /// backends agree on what a well-formed key is.
+    /// [`Error::InvalidRequest`] if `sk` doesn't match whether the table actually has a sort
+    /// key. Every [`AwsDynamoDbService`] implementation routes its key handling through here so
+    /// the backends agree on what a well-formed key is.
     pub(crate) fn resolve_sk<'a>(
         &'a self,
         sk: &Option<String>,
-    ) -> Result<Option<(&'a str, String)>, String> {
+    ) -> Result<Option<(&'a str, String)>, Error> {
         match (self.keys.sk_identifier.as_deref(), sk) {
             (Some(sk_identifier), Some(sk)) => Ok(Some((sk_identifier, sk.clone()))),
             (None, None) => Ok(None),
-            (Some(_), None) => {
-                Err("PrimaryIndex has a sort key, but none was provided".to_string())
-            }
-            (None, Some(_)) => {
-                Err("a sort key was provided, but PrimaryIndex has none".to_string())
-            }
+            (Some(_), None) => Err(Error::InvalidRequest(
+                "PrimaryIndex has a sort key, but none was provided".to_string(),
+            )),
+            (None, Some(_)) => Err(Error::InvalidRequest(
+                "a sort key was provided, but PrimaryIndex has none".to_string(),
+            )),
         }
     }
 }
@@ -172,14 +271,19 @@ pub trait AwsDynamoDbService: Send + Sync {
     ///
     /// Reads the [`Container`] stored under the base table's primary key `(pk, sk)` and, if
     /// present, returns the stored `data_version` (for optimistic concurrency control) together
-    /// with the deserialized payload. `sk` must be `Some` if and only if the implementation's
-    /// configured [`PrimaryIndex`] has a sort key; a mismatch returns an `Err`.
+    /// with the deserialized payload.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] if `sk` is not `Some` exactly when the implementation's
+    /// configured [`PrimaryIndex`] has a sort key, [`Error::Serialization`] if the stored item
+    /// doesn't deserialize into `T`, [`Error::Service`] if the backend fails.
     async fn get_item<T>(
         &self,
         pk: String,
         sk: Option<String>,
         table: &str,
-    ) -> Result<Option<(u64, T)>, String>
+    ) -> Result<Option<(u64, T)>, Error>
     where
         T: serde::de::DeserializeOwned + Send;
 
@@ -191,29 +295,41 @@ pub trait AwsDynamoDbService: Send + Sync {
     ///
     /// Use this only for writes where last-writer-wins is acceptable; prefer
     /// [`AwsDynamoDbService::put_item`] when concurrent writers must not clobber each other.
-    /// `sk` must be `Some` if and only if the implementation's configured [`PrimaryIndex`] has
-    /// a sort key; a mismatch returns an `Err`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] if `sk` is not `Some` exactly when the implementation's
+    /// configured [`PrimaryIndex`] has a sort key, [`Error::Serialization`] if `payload` doesn't
+    /// serialize, [`Error::Service`] if the backend fails. Never [`Error::Conflict`] — this
+    /// operation has no condition to fail.
     async fn put_item_unconditional<T>(
         &self,
         pk: String,
         sk: Option<String>,
         table: &str,
         payload: &T,
-    ) -> Result<(), String>
+    ) -> Result<(), Error>
     where
         T: Serialize + Send + Sync;
 
     /// DynamoDB put_item() operation with optimistic concurrency control.
     ///
     /// Writes `payload` under `(pk, sk)` in `table`, but only if the currently stored
-    /// `data_version` matches `expected_version` (which must be > 0). Does not accept `0`
-    /// (returns an error if passed).
+    /// `data_version` matches `expected_version` (which must be > 0).
     ///
-    /// On success the version is incremented and the new `data_version` is returned. If the
-    /// version check fails (a concurrent writer modified or created the item), an `Err` is
-    /// returned and the table is left untouched. `sk` must be `Some` if and only if the
-    /// implementation's configured [`PrimaryIndex`] has a sort key; a mismatch returns an
-    /// `Err`.
+    /// On success the version is incremented and the new `data_version` is returned.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Conflict`] if the version check fails, leaving the table untouched. Note that
+    /// this covers two cases the backend cannot distinguish: a concurrent writer changed the
+    /// item, *or* the item does not exist at all — the condition compares an attribute of an
+    /// existing item, so it can never create one.
+    ///
+    /// [`Error::InvalidRequest`] if `expected_version` is `0` (reserved), or if `sk` is not
+    /// `Some` exactly when the implementation's configured [`PrimaryIndex`] has a sort key.
+    /// [`Error::Serialization`] if `payload` doesn't serialize, [`Error::Service`] if the
+    /// backend fails.
     async fn put_item<T>(
         &self,
         pk: String,
@@ -221,7 +337,7 @@ pub trait AwsDynamoDbService: Send + Sync {
         table: &str,
         expected_version: u64,
         payload: &T,
-    ) -> Result<u64, String>
+    ) -> Result<u64, Error>
     where
         T: Serialize + Send + Sync;
 
@@ -232,16 +348,21 @@ pub trait AwsDynamoDbService: Send + Sync {
     /// `sk_condition` if `Some` (see [`SortKeyCondition`]), or every item under `pk` when
     /// `sk_condition` is `None`. For each matching item the stored `data_version` (for
     /// optimistic concurrency control) is returned together with the deserialized payload. An
-    /// empty `Vec` is returned when nothing matches. Returns an `Err` if `sk_condition` is
-    /// `Some` but `index` has no sort key, or if the given [`SortKeyCondition`] variant isn't
-    /// implemented by this backend.
+    /// empty `Vec` is returned when nothing matches.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] if `sk_condition` is `Some` but `index` has no sort key,
+    /// [`Error::Unsupported`] if the given [`SortKeyCondition`] variant isn't implemented by
+    /// this backend, [`Error::Serialization`] if a matched item doesn't deserialize into `T`,
+    /// [`Error::Service`] if the backend fails.
     async fn query_items<T>(
         &self,
         index: impl Into<AnyIndex> + Send,
         pk: String,
         sk_condition: Option<SortKeyCondition>,
         table: &str,
-    ) -> Result<Vec<(u64, T)>, String>
+    ) -> Result<Vec<(u64, T)>, Error>
     where
         T: serde::de::DeserializeOwned + Send;
 
@@ -249,11 +370,13 @@ pub trait AwsDynamoDbService: Send + Sync {
     ///
     /// Removes the [`Container`] stored under `(pk, sk)` in `table`. The operation is
     /// idempotent: deleting a key that does not exist succeeds and is treated as a no-op
-    /// (mirroring DynamoDB's DeleteItem semantics). On success `Ok(())` is returned; transport
-    /// or service errors are surfaced as an `Err` describing the failure. `sk` must be `Some`
-    /// if and only if the implementation's configured [`PrimaryIndex`] has a sort key; a
-    /// mismatch returns an `Err`.
-    async fn delete_item(&self, pk: String, sk: Option<String>, table: &str) -> Result<(), String>;
+    /// (mirroring DynamoDB's DeleteItem semantics).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] if `sk` is not `Some` exactly when the implementation's
+    /// configured [`PrimaryIndex`] has a sort key, [`Error::Service`] if the backend fails.
+    async fn delete_item(&self, pk: String, sk: Option<String>, table: &str) -> Result<(), Error>;
 }
 
 #[cfg(test)]
@@ -261,7 +384,32 @@ mod tests {
     use serde::Serialize;
     use std::collections::HashMap;
 
-    use crate::Container;
+    use crate::{Container, Error};
+
+    #[test]
+    fn conflict_display_names_the_key_and_expected_version() {
+        let err = Error::Conflict {
+            pk: "device#1".to_string(),
+            sk: Some("METADATA".to_string()),
+            expected_version: 4,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            r#"Optimistic concurrency conflict for pk=device#1, sk=Some("METADATA"): expected version 4"#
+        );
+    }
+
+    #[test]
+    fn error_is_a_std_error() {
+        // Callers need `?` into Box<dyn Error> / anyhow to keep working.
+        fn boxed() -> Result<(), Box<dyn std::error::Error>> {
+            Err(Error::Service("backend exploded".to_string()))?;
+            Ok(())
+        }
+
+        assert_eq!(boxed().unwrap_err().to_string(), "backend exploded");
+    }
 
     #[test]
     fn test_container_fields_not_renamed() {

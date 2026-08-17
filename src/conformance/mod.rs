@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AwsDynamoDbService, GlobalSecondaryIndex, KeySchema, LocalSecondaryIndex, PrimaryIndex,
+    AwsDynamoDbService, Error, GlobalSecondaryIndex, KeySchema, LocalSecondaryIndex, PrimaryIndex,
     SortKeyCondition,
 };
 
@@ -237,7 +237,22 @@ pub(crate) async fn put_item_rejects_stale_version<H: Harness>(h: &H) {
         .await
         .unwrap_err();
 
-    assert!(err.contains("Optimistic concurrency conflict"), "{err}");
+    assert!(
+        matches!(
+            err,
+            Error::Conflict {
+                expected_version: 4,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // Display is formatted by Error itself rather than at each call site, so asserting the exact
+    // text here — in a test both backends run — is what keeps their wording from diverging.
+    assert_eq!(
+        err.to_string(),
+        r#"Optimistic concurrency conflict for pk=device#1, sk=Some("METADATA"): expected version 4"#
+    );
     // The stored item must be left untouched after a rejected write.
     let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
     assert_eq!(result, Some((5, original)));
@@ -257,7 +272,7 @@ pub(crate) async fn put_item_rejects_expected_version_zero<H: Harness>(h: &H) {
             .await
             .unwrap_err();
 
-    assert!(err.contains("does not accept version=0"), "{err}");
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
 }
 
 /// `put_item`'s condition compares an attribute of an existing item, so against a missing key it
@@ -281,7 +296,9 @@ pub(crate) async fn put_item_cannot_create_a_missing_item<H: Harness>(h: &H) {
         .await
         .unwrap_err();
 
-    assert!(err.contains("Optimistic concurrency conflict"), "{err}");
+    // Indistinguishable from a genuine lost race: the backend reports the same failed
+    // condition either way, which is why `create_item` has to be its own operation.
+    assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
     let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
     assert_eq!(result, None, "a rejected write must not create the item");
 }
@@ -555,7 +572,7 @@ pub(crate) async fn query_items_rejects_sk_condition_when_index_has_no_sort_key<
         .await
         .unwrap_err();
 
-    assert!(err.contains("no sort key"), "{err}");
+    assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
 }
 
 pub(crate) async fn query_items_rejects_unimplemented_sort_key_condition<H: Harness>(h: &H) {
@@ -571,7 +588,7 @@ pub(crate) async fn query_items_rejects_unimplemented_sort_key_condition<H: Harn
         .await
         .unwrap_err();
 
-    assert!(err.contains("not yet implemented"), "{err}");
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -690,10 +707,11 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
 
     // Table has a sort key, caller omitted it.
     let f = h.setup(composite_key()).await;
-    let missing = |err: String| {
+    let missing = |err: Error| {
         assert!(
-            err.contains("PrimaryIndex has a sort key, but none was provided"),
-            "{err}"
+            matches!(&err, Error::InvalidRequest(message)
+                if message.contains("PrimaryIndex has a sort key, but none was provided")),
+            "{err:?}"
         )
     };
     missing(
@@ -720,10 +738,11 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
     // Table has no sort key, caller supplied one.
     let f = h.setup(partition_only_key()).await;
     let (pk, sk) = key("device#1", Some("METADATA"));
-    let unexpected = |err: String| {
+    let unexpected = |err: Error| {
         assert!(
-            err.contains("a sort key was provided, but PrimaryIndex has none"),
-            "{err}"
+            matches!(&err, Error::InvalidRequest(message)
+                if message.contains("a sort key was provided, but PrimaryIndex has none")),
+            "{err:?}"
         )
     };
     unexpected(
@@ -840,7 +859,7 @@ pub(crate) async fn unconditional_write_revives_a_stale_version_token<H: Harness
         f.db.put_item(pk.clone(), sk.clone(), &f.table, held_version, &payload)
             .await
             .unwrap_err();
-    assert!(err.contains("Optimistic concurrency conflict"), "{err}");
+    assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
 
     // An unconditional write rewinds the version to 1...
     f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)

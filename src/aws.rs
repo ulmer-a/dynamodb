@@ -4,7 +4,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{AnyIndex, AwsDynamoDbService, Container, PrimaryIndex, SortKeyCondition};
+use crate::{AnyIndex, AwsDynamoDbService, Container, Error, PrimaryIndex, SortKeyCondition};
 
 /// AWS-backed [`AwsDynamoDbService`] implementation talking to a real DynamoDB table.
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ impl AwsDynamoDb {
     /// Resolves `sk` against the configured [`PrimaryIndex`], returning the sort key's
     /// attribute name paired with the value when the table has one. `Err` if `sk` doesn't
     /// match whether the table actually has a sort key.
-    fn resolve_sk(&self, sk: &Option<String>) -> Result<Option<(&str, String)>, String> {
+    fn resolve_sk(&self, sk: &Option<String>) -> Result<Option<(&str, String)>, Error> {
         self.primary_index.resolve_sk(sk)
     }
 }
@@ -52,7 +52,7 @@ impl AwsDynamoDbService for AwsDynamoDb {
         pk: String,
         sk: Option<String>,
         table: &str,
-    ) -> Result<Option<(u64, T)>, String>
+    ) -> Result<Option<(u64, T)>, Error>
     where
         T: DeserializeOwned + Send,
     {
@@ -66,15 +66,19 @@ impl AwsDynamoDbService for AwsDynamoDb {
             request = request.key(sk_identifier, AttributeValue::S(sk_value));
         }
 
-        let result = request
-            .send()
-            .await
-            .map_err(|e| format!("DynamoDB GetItem failed for pk={pk}, sk={sk:?}: {e}"))?;
+        let result = request.send().await.map_err(|e| {
+            Error::Service(format!(
+                "DynamoDB GetItem failed for pk={pk}, sk={sk:?}: {e}"
+            ))
+        })?;
 
         result.item.map_or(Ok(None), |hashmap| {
             // Deserialize container
-            let container: Container<T> = serde_dynamo::from_item(hashmap)
-                .map_err(|e| format!("Failed to deserialize item for pk={pk}, sk={sk:?}: {e}"))?;
+            let container: Container<T> = serde_dynamo::from_item(hashmap).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to deserialize item for pk={pk}, sk={sk:?}: {e}"
+                ))
+            })?;
 
             Ok(Some((container.data_version, container.payload)))
         })
@@ -86,7 +90,7 @@ impl AwsDynamoDbService for AwsDynamoDb {
         sk: Option<String>,
         table: &str,
         payload: &T,
-    ) -> Result<(), String>
+    ) -> Result<(), Error>
     where
         T: Serialize + Send + Sync,
     {
@@ -97,8 +101,12 @@ impl AwsDynamoDbService for AwsDynamoDb {
             payload,
         };
 
-        let mut item: HashMap<String, AttributeValue> = serde_dynamo::to_item(&container)
-            .map_err(|e| format!("Failed to serialize item for pk={pk}, sk={sk:?}: {e}"))?;
+        let mut item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(&container).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to serialize item for pk={pk}, sk={sk:?}: {e}"
+                ))
+            })?;
         item.insert(
             self.primary_index.keys.pk_identifier.clone(),
             AttributeValue::S(pk.clone()),
@@ -113,7 +121,11 @@ impl AwsDynamoDbService for AwsDynamoDb {
             .set_item(Some(item))
             .send()
             .await
-            .map_err(|e| format!("DynamoDB PutItem failed for pk={pk}, sk={sk:?}: {e}"))?;
+            .map_err(|e| {
+                Error::Service(format!(
+                    "DynamoDB PutItem failed for pk={pk}, sk={sk:?}: {e}"
+                ))
+            })?;
 
         Ok(())
     }
@@ -125,14 +137,12 @@ impl AwsDynamoDbService for AwsDynamoDb {
         table: &str,
         expected_version: u64,
         payload: &T,
-    ) -> Result<u64, String>
+    ) -> Result<u64, Error>
     where
         T: Serialize + Send + Sync,
     {
         if expected_version == 0 {
-            return Err(
-                "put_item() does not accept version=0. Use put_item_unconditional()".to_string(),
-            );
+            return Err(Error::zero_expected_version());
         }
 
         let sk_attr = self.resolve_sk(&sk)?;
@@ -143,8 +153,12 @@ impl AwsDynamoDbService for AwsDynamoDb {
             payload,
         };
 
-        let mut item: HashMap<String, AttributeValue> = serde_dynamo::to_item(&container)
-            .map_err(|e| format!("Failed to serialize item for pk={pk}, sk={sk:?}: {e}"))?;
+        let mut item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(&container).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to serialize item for pk={pk}, sk={sk:?}: {e}"
+                ))
+            })?;
         item.insert(
             self.primary_index.keys.pk_identifier.clone(),
             AttributeValue::S(pk.clone()),
@@ -166,12 +180,18 @@ impl AwsDynamoDbService for AwsDynamoDb {
 
         request.send().await.map_err(|e| {
             let err = e.into_service_error();
+            // A failed conditional check is the CAS losing, not the service failing. DynamoDB
+            // doesn't report the version it actually found, so Error::Conflict doesn't carry it.
             if err.is_conditional_check_failed_exception() {
-                format!(
-                    "Optimistic concurrency conflict for pk={pk}, sk={sk:?}: expected version {expected_version:?}"
-                )
+                Error::Conflict {
+                    pk: pk.clone(),
+                    sk: sk.clone(),
+                    expected_version,
+                }
             } else {
-                format!("DynamoDB PutItem failed for pk={pk}, sk={sk:?}: {err}")
+                Error::Service(format!(
+                    "DynamoDB PutItem failed for pk={pk}, sk={sk:?}: {err}"
+                ))
             }
         })?;
 
@@ -184,7 +204,7 @@ impl AwsDynamoDbService for AwsDynamoDb {
         pk: String,
         sk_condition: Option<SortKeyCondition>,
         table: &str,
-    ) -> Result<Vec<(u64, T)>, String>
+    ) -> Result<Vec<(u64, T)>, Error>
     where
         T: DeserializeOwned + Send,
     {
@@ -193,9 +213,7 @@ impl AwsDynamoDbService for AwsDynamoDb {
         let sk_identifier = index.sk_identifier();
 
         if sk_condition.is_some() && sk_identifier.is_none() {
-            return Err(
-                "a sort key condition was provided but the index has no sort key".to_string(),
-            );
+            return Err(Error::sk_condition_without_sort_key());
         }
 
         let mut key_condition = "#pk = :pk".to_string();
@@ -215,7 +233,9 @@ impl AwsDynamoDbService for AwsDynamoDb {
                     values.push((":sk_high".to_string(), AttributeValue::S(high.clone())));
                 }
                 other => {
-                    return Err(format!("{other:?} is not yet implemented by AwsDynamoDb"));
+                    return Err(Error::Unsupported(format!(
+                        "{other:?} is not yet implemented by AwsDynamoDb"
+                    )));
                 }
             }
         }
@@ -244,11 +264,12 @@ impl AwsDynamoDbService for AwsDynamoDb {
             let result = request
                 .send()
                 .await
-                .map_err(|e| format!("DynamoDB Query failed for pk={pk}: {e}"))?;
+                .map_err(|e| Error::Service(format!("DynamoDB Query failed for pk={pk}: {e}")))?;
 
             for hashmap in result.items.unwrap_or_default() {
-                let container: Container<T> = serde_dynamo::from_item(hashmap)
-                    .map_err(|e| format!("Failed to deserialize item for pk={pk}: {e}"))?;
+                let container: Container<T> = serde_dynamo::from_item(hashmap).map_err(|e| {
+                    Error::Serialization(format!("Failed to deserialize item for pk={pk}: {e}"))
+                })?;
                 items.push((container.data_version, container.payload));
             }
 
@@ -261,7 +282,7 @@ impl AwsDynamoDbService for AwsDynamoDb {
         Ok(items)
     }
 
-    async fn delete_item(&self, pk: String, sk: Option<String>, table: &str) -> Result<(), String> {
+    async fn delete_item(&self, pk: String, sk: Option<String>, table: &str) -> Result<(), Error> {
         let sk_attr = self.resolve_sk(&sk)?;
 
         let mut request = self.client.delete_item().table_name(table).key(
@@ -272,10 +293,11 @@ impl AwsDynamoDbService for AwsDynamoDb {
             request = request.key(sk_identifier, AttributeValue::S(sk_value));
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| format!("DynamoDB DeleteItem failed for pk={pk}, sk={sk:?}: {e}"))?;
+        request.send().await.map_err(|e| {
+            Error::Service(format!(
+                "DynamoDB DeleteItem failed for pk={pk}, sk={sk:?}: {e}"
+            ))
+        })?;
 
         Ok(())
     }
