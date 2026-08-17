@@ -331,11 +331,10 @@ impl AwsDynamoDbService for AwsDynamoDb {
     where
         T: Serialize + Send + Sync,
     {
-        if expected_version == 0 {
-            return Err(Error::zero_expected_version());
-        }
-
         let sk_attr = self.resolve_sk(&sk)?;
+        // Also correct for expected_version 0: an unversioned record lands at
+        // INITIAL_DATA_VERSION. WriteCondition renders that guard as an absence check rather
+        // than an equality one.
         let new_version = expected_version + 1;
         let item = self.build_item(&pk, &sk_attr, new_version, payload)?;
 

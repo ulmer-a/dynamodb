@@ -196,10 +196,6 @@ impl AwsDynamoDbService for MockDynamoDb {
     where
         T: Serialize + Send + Sync,
     {
-        if expected_version == 0 {
-            return Err(Error::zero_expected_version());
-        }
-
         self.primary_index.resolve_sk(&sk)?;
 
         let value = serde_json::to_value(payload)
@@ -217,8 +213,10 @@ impl AwsDynamoDbService for MockDynamoDb {
         };
         let current_version = guard.get(&map_key).map(|(version, _)| *version);
 
-        // Optimistic concurrency: the stored version (or its absence) must match what the
-        // caller expects, otherwise a concurrent writer has changed the item.
+        // Optimistic concurrency: the stored version must match what the caller expects,
+        // otherwise a concurrent writer has changed the item. An absent item never matches, so
+        // this can't create one — including for expected_version 0, which means "exists but
+        // unversioned" rather than "does not exist".
         if current_version != Some(expected_version) {
             return Err(Error::Conflict {
                 pk,
@@ -227,6 +225,7 @@ impl AwsDynamoDbService for MockDynamoDb {
             });
         }
 
+        // An unversioned record (0) lands at INITIAL_DATA_VERSION, upgrading it onto the scheme.
         let new_version = expected_version + 1;
         guard.insert(map_key, (new_version, value));
         Ok(new_version)
@@ -439,16 +438,8 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some((0, payload.clone())));
 
-        // A legacy record is unwritable through put_item, because put_item rejects 0 outright.
-        let err = db
-            .put_item(pk.clone(), sk.clone(), "BaluCoreTable", 0, &payload)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
-
-        // ...and create_item won't clobber it either: it tests whether the item exists, not
-        // what version it holds. So a legacy record is currently only writable through
-        // put_item_unconditional. Phase 4 is what closes that gap.
+        // create_item won't clobber it: it tests whether the item exists, not what version it
+        // holds.
         let err = db
             .create_item(pk.clone(), sk.clone(), "BaluCoreTable", &payload)
             .await
@@ -461,20 +452,30 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some((0, payload.clone())));
 
-        // put_item_unconditional is the one operation that can write it, and doing so advances
-        // the version off 0, upgrading the record onto the versioning scheme.
-        #[allow(
-            deprecated,
-            reason = "the deprecated operation is the only writer for legacy records"
-        )]
+        // Feeding the version 0 that get_item reported straight back into put_item upgrades the
+        // record onto the versioning scheme — no special case in the caller's loop.
+        let upgraded = Payload {
+            name: "upgraded".to_string(),
+            count: 2,
+        };
         let version = db
-            .put_item_unconditional(pk.clone(), sk.clone(), "BaluCoreTable", &payload)
+            .put_item(pk.clone(), sk.clone(), "BaluCoreTable", 0, &upgraded)
             .await
             .unwrap();
         assert_eq!(version, INITIAL_DATA_VERSION);
 
-        let result: Option<(u64, Payload)> = db.get_item(pk, sk, "BaluCoreTable").await.unwrap();
-        assert_eq!(result, Some((1, payload)));
+        let result: Option<(u64, Payload)> = db
+            .get_item(pk.clone(), sk.clone(), "BaluCoreTable")
+            .await
+            .unwrap();
+        assert_eq!(result, Some((1, upgraded.clone())));
+
+        // Once upgraded, version 0 no longer matches: the record is versioned like any other.
+        let err = db
+            .put_item(pk, sk, "BaluCoreTable", 0, &payload)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
     }
 
     #[tokio::test]

@@ -75,18 +75,9 @@ pub enum Error {
 }
 
 impl Error {
-    /// Rejects `expected_version == 0`, which is reserved.
+    /// Rejects a [`SortKeyCondition`] against an index that has no sort key.
     ///
     /// Shared so the two backends can't drift on the wording of a check they both perform.
-    #[cfg(any(feature = "aws", feature = "mock"))]
-    pub(crate) fn zero_expected_version() -> Self {
-        Error::InvalidRequest(
-            "put_item() does not accept version=0. Use put_item_unconditional()".to_string(),
-        )
-    }
-
-    /// Rejects a [`SortKeyCondition`] against an index that has no sort key. Shared for the same
-    /// reason as [`Error::zero_expected_version`].
     #[cfg(any(feature = "aws", feature = "mock"))]
     pub(crate) fn sk_condition_without_sort_key() -> Self {
         Error::InvalidRequest(
@@ -260,8 +251,9 @@ impl AnyIndex {
 
 /// The `data_version` a newly created item starts at.
 ///
-/// `0` is reserved: it's what a record written before versioning existed reads back as (see
-/// [`Container::data_version`]), and [`AwsDynamoDbService::put_item`] rejects it.
+/// `0` is below it, and means "stored before versioning existed" (see
+/// [`Container::data_version`]). Passing `0` to [`AwsDynamoDbService::put_item`] upgrades such a
+/// record onto the versioning scheme, landing it here.
 pub const INITIAL_DATA_VERSION: u64 = 1;
 
 /// The stored representation of an item, minus its primary key.
@@ -369,9 +361,10 @@ pub trait AwsDynamoDbService: Send + Sync {
     /// # Deprecated
     ///
     /// Prefer [`AwsDynamoDbService::create_item`] to bootstrap an item and
-    /// [`AwsDynamoDbService::put_item`] to update one. Between them they cover every case
-    /// safely, and both tell the caller when they lost a race — this operation, by design,
-    /// cannot. It remains the only way to write a record stored without a `data_version`.
+    /// [`AwsDynamoDbService::put_item`] to update one — including to upgrade a record stored
+    /// without a `data_version`, which `put_item` handles by taking `expected_version` of `0`.
+    /// Between them they cover every case safely, and both tell the caller when they lost a
+    /// race. This operation, by design, cannot.
     ///
     /// # Errors
     ///
@@ -399,21 +392,35 @@ pub trait AwsDynamoDbService: Send + Sync {
     /// DynamoDB put_item() operation with optimistic concurrency control.
     ///
     /// Writes `payload` under `(pk, sk)` in `table`, but only if the currently stored
-    /// `data_version` matches `expected_version` (which must be > 0).
+    /// `data_version` matches `expected_version`.
     ///
     /// On success the version is incremented and the new `data_version` is returned.
+    ///
+    /// # Upgrading a legacy record
+    ///
+    /// `expected_version` of `0` means "the item exists but carries no `data_version`" — a
+    /// record written before versioning existed, which [`AwsDynamoDbService::get_item`] reports
+    /// as version `0`. The write succeeds only if that is still true, and lands the record at
+    /// [`INITIAL_DATA_VERSION`], after which it takes part in optimistic concurrency like any
+    /// other item.
+    ///
+    /// This is a compare-and-swap like any other, so the read-modify-write loop needs no special
+    /// case: feed back whatever version `get_item` returned, `0` included.
+    ///
+    /// Note that `0` does *not* mean "create if absent" — use
+    /// [`AwsDynamoDbService::create_item`] for that. The two conditions are mutually exclusive:
+    /// one requires the item to exist, the other requires it not to.
     ///
     /// # Errors
     ///
     /// [`Error::Conflict`] if the version check fails, leaving the table untouched. Note that
     /// this covers two cases the backend cannot distinguish: a concurrent writer changed the
-    /// item, *or* the item does not exist at all — the condition compares an attribute of an
-    /// existing item, so it can never create one.
+    /// item, *or* the item does not exist at all — every condition this operation can emit
+    /// requires an existing item, so it can never create one.
     ///
-    /// [`Error::InvalidRequest`] if `expected_version` is `0` (reserved), or if `sk` is not
-    /// `Some` exactly when the implementation's configured [`PrimaryIndex`] has a sort key.
-    /// [`Error::Serialization`] if `payload` doesn't serialize, [`Error::Service`] if the
-    /// backend fails.
+    /// [`Error::InvalidRequest`] if `sk` is not `Some` exactly when the implementation's
+    /// configured [`PrimaryIndex`] has a sort key. [`Error::Serialization`] if `payload` doesn't
+    /// serialize, [`Error::Service`] if the backend fails.
     async fn put_item<T>(
         &self,
         pk: String,

@@ -174,38 +174,26 @@ impl Harness for DynamoDbLocalHarness {
 
 crate::conformance::conformance_suite!(DynamoDbLocalHarness);
 
-/// A record written before versioning existed carries no `data_version` attribute at all, and
-/// DynamoDB evaluates a comparison against an absent attribute as false — so the compare-and-swap
-/// inside `put_item_unconditional` has to match version 0 by absence rather than by equality.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct LegacyPayload {
+    name: String,
+}
+
+/// Seeds an item the way a pre-versioning writer would have — no `data_version` attribute at all
+/// — and returns a service bound to its table.
 ///
-/// This can't live in the shared conformance suite: the trait offers no way to produce an
-/// unversioned item, so seeding one needs raw SDK access. It matters because
-/// `put_item_unconditional` is currently the *only* operation that can write such a record —
-/// `put_item` rejects version 0 and `create_item` refuses an existing item. If the condition were
-/// wrong, every retry would fail and legacy records would become unwritable.
-#[allow(
-    deprecated,
-    reason = "the deprecated operation is the only writer for legacy records"
-)]
-#[tokio::test]
-async fn put_item_unconditional_can_write_a_legacy_record() {
+/// The trait offers no way to produce such an item, which is why the legacy tests below can't
+/// live in the shared conformance suite.
+async fn legacy_record_fixture() -> (AwsDynamoDb, String) {
     use aws_sdk_dynamodb::types::AttributeValue;
-    use serde::{Deserialize, Serialize};
 
-    use crate::AwsDynamoDbService;
     use crate::conformance::{composite_key, primary_index};
-
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Payload {
-        name: String,
-    }
 
     let client = client().await;
     let table = unique_table_name();
     let keys = composite_key();
     create_table(&client, &table, &keys).await;
 
-    // Seed an item the way a pre-versioning writer would have: no data_version attribute.
     client
         .put_item()
         .table_name(&table)
@@ -216,28 +204,43 @@ async fn put_item_unconditional_can_write_a_legacy_record() {
         .await
         .expect("failed to seed legacy item");
 
-    let db = AwsDynamoDb::from_client(client, primary_index(keys));
+    (AwsDynamoDb::from_client(client, primary_index(keys)), table)
+}
+
+/// Feeding the version 0 that `get_item` reported straight back into `put_item` upgrades an
+/// unversioned record onto the versioning scheme.
+///
+/// This is the case that forced `create_item` to be its own operation rather than overloading
+/// version 0: a legacy record carries no `data_version` attribute at all, and DynamoDB evaluates
+/// a comparison against an absent attribute as false — so version 0 has to be matched by absence,
+/// which is the exact opposite of the `attribute_not_exists(pk)` guard "create if absent" needs.
+#[tokio::test]
+async fn put_item_with_version_zero_upgrades_a_legacy_record() {
+    use crate::AwsDynamoDbService;
+
+    let (db, table) = legacy_record_fixture().await;
     let (pk, sk) = ("device#legacy".to_string(), Some("METADATA".to_string()));
 
     // It reads back as version 0, the documented stand-in for "unversioned".
-    let stored: Option<(u64, Payload)> = db.get_item(pk.clone(), sk.clone(), &table).await.unwrap();
+    let stored: Option<(u64, LegacyPayload)> =
+        db.get_item(pk.clone(), sk.clone(), &table).await.unwrap();
     assert_eq!(
         stored,
         Some((
             0,
-            Payload {
+            LegacyPayload {
                 name: "legacy".to_string()
             }
         ))
     );
 
-    // And it can be written, which upgrades it onto the versioning scheme.
     let version = db
-        .put_item_unconditional(
+        .put_item(
             pk.clone(),
             sk.clone(),
             &table,
-            &Payload {
+            0,
+            &LegacyPayload {
                 name: "upgraded".to_string(),
             },
         )
@@ -245,12 +248,100 @@ async fn put_item_unconditional_can_write_a_legacy_record() {
         .unwrap();
     assert_eq!(version, 1);
 
-    let stored: Option<(u64, Payload)> = db.get_item(pk, sk, &table).await.unwrap();
+    let stored: Option<(u64, LegacyPayload)> =
+        db.get_item(pk.clone(), sk.clone(), &table).await.unwrap();
     assert_eq!(
         stored,
         Some((
             1,
-            Payload {
+            LegacyPayload {
+                name: "upgraded".to_string()
+            }
+        ))
+    );
+
+    // Once upgraded, version 0 no longer matches: the record is versioned like any other.
+    let err = db
+        .put_item(
+            pk,
+            sk,
+            &table,
+            0,
+            &LegacyPayload {
+                name: "again".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Conflict { .. }), "{err:?}");
+}
+
+/// `create_item` must not clobber a legacy record: its guard tests whether the item exists, not
+/// what version it holds.
+#[tokio::test]
+async fn create_item_refuses_a_legacy_record() {
+    use crate::AwsDynamoDbService;
+
+    let (db, table) = legacy_record_fixture().await;
+    let (pk, sk) = ("device#legacy".to_string(), Some("METADATA".to_string()));
+
+    let err = db
+        .create_item(
+            pk.clone(),
+            sk.clone(),
+            &table,
+            &LegacyPayload {
+                name: "clobber".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, crate::Error::AlreadyExists { .. }), "{err:?}");
+    let stored: Option<(u64, LegacyPayload)> = db.get_item(pk, sk, &table).await.unwrap();
+    assert_eq!(
+        stored,
+        Some((
+            0,
+            LegacyPayload {
+                name: "legacy".to_string()
+            }
+        ))
+    );
+}
+
+/// The deprecated last-writer-wins path must keep working on a legacy record too, since its
+/// retry loop reads version 0 and has to guard on it by absence.
+#[allow(
+    deprecated,
+    reason = "the deprecated operation must still handle legacy records"
+)]
+#[tokio::test]
+async fn put_item_unconditional_can_write_a_legacy_record() {
+    use crate::AwsDynamoDbService;
+
+    let (db, table) = legacy_record_fixture().await;
+    let (pk, sk) = ("device#legacy".to_string(), Some("METADATA".to_string()));
+
+    let version = db
+        .put_item_unconditional(
+            pk.clone(),
+            sk.clone(),
+            &table,
+            &LegacyPayload {
+                name: "upgraded".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(version, 1);
+
+    let stored: Option<(u64, LegacyPayload)> = db.get_item(pk, sk, &table).await.unwrap();
+    assert_eq!(
+        stored,
+        Some((
+            1,
+            LegacyPayload {
                 name: "upgraded".to_string()
             }
         ))

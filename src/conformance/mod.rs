@@ -132,8 +132,8 @@ fn key(pk: &str, sk: Option<&str>) -> (String, Option<String>) {
 ///
 /// Goes through the trait rather than any backend-specific fixture helper, which means it can
 /// only reach versions >= 1: it creates the item at version 1 and then CASes it forward. Real
-/// tables have no other way in, and a legacy record (version 0) can't be produced this way at
-/// all — that's a Phase 4 concern.
+/// tables have no other way in, so a legacy record (version 0) can't be produced here at all —
+/// seeding one needs backend-specific access.
 async fn seed<D, T>(db: &D, pk: &str, sk: Option<&str>, table: &str, version: u64, payload: &T)
 where
     D: AwsDynamoDbService,
@@ -372,21 +372,64 @@ pub(crate) async fn put_item_rejects_stale_version<H: Harness>(h: &H) {
     assert_eq!(result, Some((5, original)));
 }
 
-pub(crate) async fn put_item_rejects_expected_version_zero<H: Harness>(h: &H) {
+/// `expected_version` 0 means "exists but unversioned". A versioned item therefore doesn't match
+/// it, and the write is refused.
+///
+/// The upgrade actually succeeding needs a record stored without a `data_version`, which the
+/// trait offers no way to produce — so that half is covered per-backend, by
+/// `mock::tests::insert_can_seed_a_legacy_record_at_version_zero` and by
+/// `local::put_item_with_version_zero_upgrades_a_legacy_record`.
+pub(crate) async fn put_item_with_version_zero_rejects_a_versioned_item<H: Harness>(h: &H) {
     let f = h.setup(composite_key()).await;
     let (pk, sk) = key("device#1", Some("METADATA"));
-    let payload = Payload {
-        name: "balu".to_string(),
+    let original = Payload {
+        name: "original".to_string(),
         count: 1,
     };
-    seed(&f.db, "device#1", Some("METADATA"), &f.table, 1, &payload).await;
+    seed(&f.db, "device#1", Some("METADATA"), &f.table, 1, &original).await;
 
     let err =
-        f.db.put_item(pk, sk, &f.table, 0, &payload)
-            .await
-            .unwrap_err();
+        f.db.put_item(
+            pk.clone(),
+            sk.clone(),
+            &f.table,
+            0,
+            &Payload {
+                name: "upgraded".to_string(),
+                count: 2,
+            },
+        )
+        .await
+        .unwrap_err();
 
-    assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+    assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+    let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(result, Some((1, original)));
+}
+
+/// `0` means "exists but unversioned", not "create if absent" — those conditions are mutually
+/// exclusive, and `create_item` owns the second one.
+pub(crate) async fn put_item_with_version_zero_cannot_create_a_missing_item<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#missing", Some("METADATA"));
+
+    let err =
+        f.db.put_item(
+            pk.clone(),
+            sk.clone(),
+            &f.table,
+            0,
+            &Payload {
+                name: "balu".to_string(),
+                count: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+    let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(result, None);
 }
 
 /// `put_item`'s condition compares an attribute of an existing item, so against a missing key it
@@ -1063,7 +1106,8 @@ macro_rules! conformance_suite {
             create_item_succeeds_again_after_delete,
             put_item_updates_when_version_matches,
             put_item_rejects_stale_version,
-            put_item_rejects_expected_version_zero,
+            put_item_with_version_zero_rejects_a_versioned_item,
+            put_item_with_version_zero_cannot_create_a_missing_item,
             put_item_cannot_create_a_missing_item,
             put_item_unconditional_creates_item_with_version_one,
             put_item_unconditional_overwrites_and_advances_version,
