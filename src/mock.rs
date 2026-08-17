@@ -4,7 +4,9 @@ use std::sync::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{AnyIndex, AwsDynamoDbService, Error, PrimaryIndex, SortKeyCondition};
+use crate::{
+    AnyIndex, AwsDynamoDbService, Error, INITIAL_DATA_VERSION, PrimaryIndex, SortKeyCondition,
+};
 
 /// In-memory [`AwsDynamoDbService`] implementation for local running and unit testing.
 ///
@@ -111,6 +113,42 @@ impl AwsDynamoDbService for MockDynamoDb {
         }
     }
 
+    async fn create_item<T>(
+        &self,
+        pk: String,
+        sk: Option<String>,
+        table: &str,
+        payload: &T,
+    ) -> Result<u64, Error>
+    where
+        T: Serialize + Send + Sync,
+    {
+        self.primary_index.resolve_sk(&sk)?;
+
+        let value = serde_json::to_value(payload)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize mock payload: {e}")))?;
+
+        let mut guard = self
+            .items
+            .lock()
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?;
+
+        let map_key = MockDbKey {
+            table_name: table.to_string(),
+            pk: pk.clone(),
+            sk: sk.clone(),
+        };
+
+        // Mirrors `attribute_not_exists(<pk>)`: the presence of the item is what's tested, not
+        // its version, so a legacy record stored at version 0 also blocks the create.
+        if guard.contains_key(&map_key) {
+            return Err(Error::AlreadyExists { pk, sk });
+        }
+
+        guard.insert(map_key, (INITIAL_DATA_VERSION, value));
+        Ok(INITIAL_DATA_VERSION)
+    }
+
     async fn put_item_unconditional<T>(
         &self,
         pk: String,
@@ -136,7 +174,7 @@ impl AwsDynamoDbService for MockDynamoDb {
                     pk,
                     sk,
                 },
-                (1, value),
+                (INITIAL_DATA_VERSION, value),
             );
         Ok(())
     }
@@ -397,10 +435,22 @@ mod tests {
 
         // A legacy record is unwritable through put_item, because put_item rejects 0 outright.
         let err = db
-            .put_item(pk, sk, "BaluCoreTable", 0, &payload)
+            .put_item(pk.clone(), sk.clone(), "BaluCoreTable", 0, &payload)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+
+        // ...and create_item won't clobber it either: it tests whether the item exists, not
+        // what version it holds. So a legacy record is currently only writable through
+        // put_item_unconditional. Phase 4 is what closes that gap.
+        let err = db
+            .create_item(pk.clone(), sk.clone(), "BaluCoreTable", &payload)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists { .. }), "{err:?}");
+
+        let result: Option<(u64, Payload)> = db.get_item(pk, sk, "BaluCoreTable").await.unwrap();
+        assert_eq!(result, Some((0, payload)));
     }
 
     #[tokio::test]

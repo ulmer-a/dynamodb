@@ -4,7 +4,10 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{AnyIndex, AwsDynamoDbService, Container, Error, PrimaryIndex, SortKeyCondition};
+use crate::{
+    AnyIndex, AwsDynamoDbService, Container, Error, INITIAL_DATA_VERSION, PrimaryIndex,
+    SortKeyCondition,
+};
 
 /// AWS-backed [`AwsDynamoDbService`] implementation talking to a real DynamoDB table.
 #[derive(Debug, Clone)]
@@ -84,6 +87,67 @@ impl AwsDynamoDbService for AwsDynamoDb {
         })
     }
 
+    async fn create_item<T>(
+        &self,
+        pk: String,
+        sk: Option<String>,
+        table: &str,
+        payload: &T,
+    ) -> Result<u64, Error>
+    where
+        T: Serialize + Send + Sync,
+    {
+        let sk_attr = self.resolve_sk(&sk)?;
+
+        let container = Container {
+            data_version: INITIAL_DATA_VERSION,
+            payload,
+        };
+
+        let mut item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(&container).map_err(|e| {
+                Error::Serialization(format!(
+                    "Failed to serialize item for pk={pk}, sk={sk:?}: {e}"
+                ))
+            })?;
+        item.insert(
+            self.primary_index.keys.pk_identifier.clone(),
+            AttributeValue::S(pk.clone()),
+        );
+        if let Some((sk_identifier, sk_value)) = sk_attr {
+            item.insert(sk_identifier.to_string(), AttributeValue::S(sk_value));
+        }
+
+        self.client
+            .put_item()
+            .table_name(table)
+            .set_item(Some(item))
+            // DynamoDB's idiom for "write only if absent". The condition is evaluated against
+            // the item currently stored under the key, so when there is none, no attribute
+            // exists and it passes. Goes through an expression attribute name because the
+            // partition key's attribute name is caller-configurable and could collide with a
+            // DynamoDB reserved word.
+            .condition_expression("attribute_not_exists(#pk)")
+            .expression_attribute_names("#pk", self.primary_index.keys.pk_identifier.as_str())
+            .send()
+            .await
+            .map_err(|e| {
+                let err = e.into_service_error();
+                if err.is_conditional_check_failed_exception() {
+                    Error::AlreadyExists {
+                        pk: pk.clone(),
+                        sk: sk.clone(),
+                    }
+                } else {
+                    Error::Service(format!(
+                        "DynamoDB PutItem failed for pk={pk}, sk={sk:?}: {err}"
+                    ))
+                }
+            })?;
+
+        Ok(INITIAL_DATA_VERSION)
+    }
+
     async fn put_item_unconditional<T>(
         &self,
         pk: String,
@@ -97,7 +161,7 @@ impl AwsDynamoDbService for AwsDynamoDb {
         let sk_attr = self.resolve_sk(&sk)?;
 
         let container = Container {
-            data_version: 1,
+            data_version: INITIAL_DATA_VERSION,
             payload,
         };
 

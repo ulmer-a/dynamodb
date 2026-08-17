@@ -28,12 +28,21 @@ mod conformance;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Error {
+    /// [`AwsDynamoDbService::create_item`] found an item already stored under the key, so
+    /// nothing was written.
+    ///
+    /// Distinct from [`Error::Conflict`] on purpose: a caller bootstrapping an item wants to
+    /// tell "someone else already created this" apart from "my compare-and-swap lost", because
+    /// the recovery differs — re-read and merge, versus retry the swap.
+    AlreadyExists { pk: String, sk: Option<String> },
+
     /// An optimistic-concurrency check failed: the item's stored `data_version` was not
     /// `expected_version`, so a concurrent writer got there first and nothing was written.
     ///
     /// Also what [`AwsDynamoDbService::put_item`] returns for an item that does not exist,
     /// since its condition compares an attribute of an existing item and there is no way to
-    /// tell the two cases apart from the backend's response.
+    /// tell the two cases apart from the backend's response. Use
+    /// [`AwsDynamoDbService::create_item`] when the item may be absent.
     ///
     /// Deliberately does not report the version actually found: DynamoDB's failed conditional
     /// check doesn't reveal it, so a field for it could not be filled in consistently across
@@ -91,6 +100,9 @@ impl fmt::Display for Error {
         match self {
             // Formatted here rather than at each call site so every backend words a conflict
             // identically.
+            Error::AlreadyExists { pk, sk } => {
+                write!(f, "Item already exists for pk={pk}, sk={sk:?}")
+            }
             Error::Conflict {
                 pk,
                 sk,
@@ -246,6 +258,13 @@ impl AnyIndex {
     }
 }
 
+/// The `data_version` a newly created item starts at.
+///
+/// `0` is reserved: it's what a record written before versioning existed reads back as (see
+/// [`Container::data_version`]), and [`AwsDynamoDbService::put_item`] rejects it.
+#[cfg(any(feature = "aws", feature = "mock"))]
+pub(crate) const INITIAL_DATA_VERSION: u64 = 1;
+
 /// The stored representation of an item, minus its primary key.
 ///
 /// The primary key attributes are written and read separately by [`AwsDynamoDbService`]
@@ -286,6 +305,57 @@ pub trait AwsDynamoDbService: Send + Sync {
     ) -> Result<Option<(u64, T)>, Error>
     where
         T: serde::de::DeserializeOwned + Send;
+
+    /// DynamoDB put_item() operation conditioned on the item not existing.
+    ///
+    /// Writes `payload` under `(pk, sk)` in `table` at `data_version` 1, but only if no item is
+    /// stored under that key — DynamoDB's `attribute_not_exists` idiom. Returns the new
+    /// `data_version`, so the caller can carry on with [`AwsDynamoDbService::put_item`] without
+    /// re-reading.
+    ///
+    /// This is the safe way to bootstrap an item that may not exist yet. Branching on
+    /// [`AwsDynamoDbService::get_item`] returning `None` and then writing with
+    /// [`AwsDynamoDbService::put_item_unconditional`] is *not* safe: two callers can both
+    /// observe the item as absent, and the slower one's write silently destroys everything the
+    /// faster one committed. Written as a loop, with both failure modes retried:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let result = match db.get_item(pk.clone(), sk.clone(), table).await? {
+    ///         Some((version, value)) => {
+    ///             db.put_item(pk.clone(), sk.clone(), table, version, &next(value)).await.map(|_| ())
+    ///         }
+    ///         None => {
+    ///             db.create_item(pk.clone(), sk.clone(), table, &initial()).await.map(|_| ())
+    ///         }
+    ///     };
+    ///     match result {
+    ///         Ok(()) => break,
+    ///         // Someone else got there first, in either branch. Re-read and try again.
+    ///         Err(Error::Conflict { .. } | Error::AlreadyExists { .. }) => continue,
+    ///         Err(other) => return Err(other),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AlreadyExists`] if an item is already stored under the key, leaving it
+    /// untouched. This includes a legacy record stored without a `data_version` — the condition
+    /// tests the partition key attribute, not the version.
+    ///
+    /// [`Error::InvalidRequest`] if `sk` is not `Some` exactly when the implementation's
+    /// configured [`PrimaryIndex`] has a sort key, [`Error::Serialization`] if `payload` doesn't
+    /// serialize, [`Error::Service`] if the backend fails.
+    async fn create_item<T>(
+        &self,
+        pk: String,
+        sk: Option<String>,
+        table: &str,
+        payload: &T,
+    ) -> Result<u64, Error>
+    where
+        T: Serialize + Send + Sync;
 
     /// DynamoDB put_item() operation without optimistic concurrency control.
     ///

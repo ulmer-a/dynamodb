@@ -181,6 +181,120 @@ pub(crate) async fn get_item_returns_none_for_missing_key<H: Harness>(h: &H) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// create_item
+// ---------------------------------------------------------------------------------------------
+
+pub(crate) async fn create_item_creates_item_at_version_one<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    let payload = Payload {
+        name: "balu".to_string(),
+        count: 1,
+    };
+
+    let version =
+        f.db.create_item(pk.clone(), sk.clone(), &f.table, &payload)
+            .await
+            .unwrap();
+
+    assert_eq!(version, 1);
+    let result: Option<(u64, Payload)> =
+        f.db.get_item(pk.clone(), sk.clone(), &f.table)
+            .await
+            .unwrap();
+    assert_eq!(result, Some((1, payload.clone())));
+
+    // The returned version is a usable CAS token, so a caller can carry on without re-reading.
+    let next =
+        f.db.put_item(pk, sk, &f.table, version, &payload)
+            .await
+            .unwrap();
+    assert_eq!(next, 2);
+}
+
+pub(crate) async fn create_item_rejects_an_existing_item<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    let original = Payload {
+        name: "original".to_string(),
+        count: 1,
+    };
+    f.db.create_item(pk.clone(), sk.clone(), &f.table, &original)
+        .await
+        .unwrap();
+
+    let err =
+        f.db.create_item(
+            pk.clone(),
+            sk.clone(),
+            &f.table,
+            &Payload {
+                name: "clobber".to_string(),
+                count: 99,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::AlreadyExists { .. }), "{err:?}");
+    let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(
+        result,
+        Some((1, original)),
+        "a refused create must leave the stored item untouched"
+    );
+}
+
+/// The condition tests whether the item exists, not what version it holds, so an item that has
+/// been updated well past version 1 still blocks a create.
+pub(crate) async fn create_item_rejects_an_item_at_any_version<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    let original = Payload {
+        name: "original".to_string(),
+        count: 1,
+    };
+    seed(&f.db, "device#1", Some("METADATA"), &f.table, 5, &original).await;
+
+    let err =
+        f.db.create_item(
+            pk.clone(),
+            sk.clone(),
+            &f.table,
+            &Payload {
+                name: "clobber".to_string(),
+                count: 99,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::AlreadyExists { .. }), "{err:?}");
+    let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(result, Some((5, original)));
+}
+
+/// A deleted key is absent again, so it can be recreated.
+pub(crate) async fn create_item_succeeds_again_after_delete<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    let payload = Payload {
+        name: "balu".to_string(),
+        count: 1,
+    };
+    f.db.create_item(pk.clone(), sk.clone(), &f.table, &payload)
+        .await
+        .unwrap();
+    f.db.delete_item(pk.clone(), sk.clone(), &f.table)
+        .await
+        .unwrap();
+
+    let version = f.db.create_item(pk, sk, &f.table, &payload).await.unwrap();
+
+    assert_eq!(version, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
 // put_item (optimistic concurrency control)
 // ---------------------------------------------------------------------------------------------
 
@@ -720,6 +834,11 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
             .unwrap_err(),
     );
     missing(
+        f.db.create_item("device#1".to_string(), None, &f.table, &payload)
+            .await
+            .unwrap_err(),
+    );
+    missing(
         f.db.put_item_unconditional("device#1".to_string(), None, &f.table, &payload)
             .await
             .unwrap_err(),
@@ -751,6 +870,11 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
             .unwrap_err(),
     );
     unexpected(
+        f.db.create_item(pk.clone(), sk.clone(), &f.table, &payload)
+            .await
+            .unwrap_err(),
+    );
+    unexpected(
         f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)
             .await
             .unwrap_err(),
@@ -763,23 +887,13 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
     unexpected(f.db.delete_item(pk, sk, &f.table).await.unwrap_err());
 }
 
-// ---------------------------------------------------------------------------------------------
-// Known defects
-//
-// The two tests below assert behaviour that is WRONG. They exist to pin the bugs the roadmap is
-// about, so that the fixes are visible as test changes rather than landing silently. Each one
-// names the phase that must invert it.
-// ---------------------------------------------------------------------------------------------
-
-/// Two callers that both observe an item as absent race, and one silently destroys the other's
-/// committed write.
+/// Two callers both observe an item as absent and race to bootstrap it. The loser must be told,
+/// and the winner's committed update must survive.
 ///
-/// Reproduces the interleaving sequentially: each operation is individually atomic on both
-/// backends, so no real concurrency is needed to hit it — only the ordering.
-///
-/// INVERT IN PHASE 2: once `create_item` exists, actor B's bootstrap must fail with an
-/// "already exists" outcome and actor A's update at step 4 must survive.
-pub(crate) async fn concurrent_bootstrap_loses_a_committed_update<H: Harness>(h: &H) {
+/// The interleaving that used to destroy a committed write, from the v0.2.0 bootstrap-race
+/// issue. Replayed sequentially: each operation is individually atomic on both backends, so no
+/// real concurrency is needed to hit it — only the ordering.
+pub(crate) async fn concurrent_bootstrap_is_rejected_for_the_loser<H: Harness>(h: &H) {
     let f = h.setup(composite_key()).await;
     let (pk, sk) = key("counter#catalogue", Some("METADATA"));
 
@@ -800,39 +914,51 @@ pub(crate) async fn concurrent_bootstrap_loses_a_committed_update<H: Harness>(h:
         name: "A".to_string(),
         count: 1,
     };
-    f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &a_initial)
-        .await
-        .unwrap();
+    let a_created =
+        f.db.create_item(pk.clone(), sk.clone(), &f.table, &a_initial)
+            .await
+            .unwrap();
+    assert_eq!(a_created, 1);
 
-    // Step 4: actor A commits an update on top of its own bootstrap. This one is CAS-protected
-    // and reports success.
+    // Step 4: actor A commits an update on top of its own bootstrap.
     let a_updated = Payload {
         name: "A".to_string(),
         count: 2,
     };
     let a_version =
-        f.db.put_item(pk.clone(), sk.clone(), &f.table, 1, &a_updated)
+        f.db.put_item(pk.clone(), sk.clone(), &f.table, a_created, &a_updated)
             .await
             .unwrap();
     assert_eq!(a_version, 2);
 
-    // Step 5: actor B takes the `None` branch it decided on back at step 2. Nothing checks that
-    // the item is still absent, so the write lands and returns Ok.
-    let b_initial = Payload {
-        name: "B".to_string(),
-        count: 1,
-    };
-    f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &b_initial)
+    // Step 5: actor B takes the `None` branch it decided on back at step 2. The item is no
+    // longer absent, so the create is refused instead of silently landing.
+    let err =
+        f.db.create_item(
+            pk.clone(),
+            sk.clone(),
+            &f.table,
+            &Payload {
+                name: "B".to_string(),
+                count: 1,
+            },
+        )
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists { .. }), "{err:?}");
 
+    // Actor A's committed update survives, and actor B knows to re-read and retry.
     let stored: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
-    assert_eq!(
-        stored,
-        Some((1, b_initial)),
-        "known defect: actor A's committed update at step 4 is gone, and no call returned an error"
-    );
+    assert_eq!(stored, Some((2, a_updated)));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Known defects
+//
+// The test below asserts behaviour that is WRONG. It exists to pin a bug the roadmap is about,
+// so that the fix is visible as a test change rather than landing silently, and names the phase
+// that must invert it.
+// ---------------------------------------------------------------------------------------------
 
 /// `put_item_unconditional` resets `data_version` to 1 instead of advancing it, so a version
 /// token that has already been spent becomes valid again — a textbook ABA.
@@ -888,6 +1014,10 @@ macro_rules! conformance_suite {
         $crate::conformance::conformance_suite!(@cases $harness;
             get_item_returns_stored_payload_with_version,
             get_item_returns_none_for_missing_key,
+            create_item_creates_item_at_version_one,
+            create_item_rejects_an_existing_item,
+            create_item_rejects_an_item_at_any_version,
+            create_item_succeeds_again_after_delete,
             put_item_updates_when_version_matches,
             put_item_rejects_stale_version,
             put_item_rejects_expected_version_zero,
@@ -907,7 +1037,7 @@ macro_rules! conformance_suite {
             delete_item_only_removes_targeted_key,
             partition_only_primary_key_round_trip,
             operations_reject_sort_key_not_matching_schema,
-            concurrent_bootstrap_loses_a_committed_update,
+            concurrent_bootstrap_is_rejected_for_the_loser,
             unconditional_write_revives_a_stale_version_token,
         );
     };
