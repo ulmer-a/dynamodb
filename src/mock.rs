@@ -11,8 +11,7 @@ use crate::{
 /// In-memory [`AwsDynamoDbService`] implementation for local running and unit testing.
 ///
 /// Payloads are stored as `serde_json::Value` keyed by `(table, pk, sk)` alongside their
-/// `data_version`, mirroring the [`crate::Container`] layout without requiring a real
-/// DynamoDB backend.
+/// `data_version`, mirroring how a real DynamoDB item is laid out without requiring a backend.
 ///
 /// All tables in one store share the [`PrimaryIndex`] given to [`MockDynamoDb::new`], which is
 /// what every operation validates its `sk` argument against — the same check the AWS backend
@@ -23,8 +22,10 @@ pub struct MockDynamoDb {
     items: Mutex<HashMap<MockDbKey, (u64, serde_json::Value)>>,
 }
 
+/// The mock's internal map key. Not part of the public API — it appears in no signature and
+/// has no accessors.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct MockDbKey {
+struct MockDbKey {
     table_name: String,
     pk: String,
     sk: Option<String>,

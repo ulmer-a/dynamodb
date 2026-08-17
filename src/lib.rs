@@ -1,3 +1,56 @@
+//! A high-level DynamoDB abstraction with optimistic concurrency control built in.
+//!
+//! Every item is stored alongside a `data_version`, and the write operations are defined by what
+//! they expect that version to be. [`AwsDynamoDbService`] is the whole surface;
+//! [`aws::AwsDynamoDb`] talks to a real table and [`mock::MockDynamoDb`] is an in-memory stand-in
+//! for tests. Both are held to the same behaviour by a shared conformance suite that also runs
+//! against a real DynamoDB engine.
+//!
+//! # Choosing a write operation
+//!
+//! | Operation | Guard | Use when |
+//! |---|---|---|
+//! | [`create_item`](AwsDynamoDbService::create_item) | item must not exist | bootstrapping a key |
+//! | [`put_item`](AwsDynamoDbService::put_item) | stored version must equal `expected_version` | updating a key you have read |
+//! | [`add_to_counter`](AwsDynamoDbService::add_to_counter) | none; the add is atomic server-side | allocating numbers |
+//! | [`put_item_unconditional`](AwsDynamoDbService::put_item_unconditional) | none | deprecated — prefer the above |
+//!
+//! # The read-modify-write loop
+//!
+//! `get_item` returns the stored version, which feeds straight back into `put_item`. When the key
+//! may not exist yet, `create_item` covers the other branch — the two together are what make the
+//! loop safe, because both report a lost race instead of silently overwriting the winner:
+//!
+//! ```ignore
+//! loop {
+//!     let result = match db.get_item(pk.clone(), sk.clone(), table).await? {
+//!         Some((version, value)) => db
+//!             .put_item(pk.clone(), sk.clone(), table, version, &next(value))
+//!             .await
+//!             .map(|_| ()),
+//!         None => db
+//!             .create_item(pk.clone(), sk.clone(), table, &initial())
+//!             .await
+//!             .map(|_| ()),
+//!     };
+//!     match result {
+//!         Ok(()) => break,
+//!         // Someone else got there first, in either branch. Re-read and try again.
+//!         Err(Error::Conflict { .. } | Error::AlreadyExists { .. }) => continue,
+//!         Err(other) => return Err(other),
+//!     }
+//! }
+//! ```
+//!
+//! A record written before this crate's versioning existed reads back as version `0`; feeding
+//! that `0` back into `put_item` upgrades it onto the scheme, so the loop above needs no special
+//! case for it.
+//!
+//! # Features
+//!
+//! `aws` and `mock` are both on by default; disable either if you don't need it.
+//! `dynamodb-local-tests` only affects this crate's own test suite.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -19,8 +72,7 @@ mod conformance;
 /// type existed every failure was a `String` and telling those apart meant substring-matching
 /// `"Optimistic concurrency conflict"`.
 ///
-/// Marked `#[non_exhaustive]`: match with a wildcard arm, so that new variants (starting with
-/// the "already exists" outcome a future `create_item` needs) don't break you.
+/// Marked `#[non_exhaustive]`: match with a wildcard arm, so that new variants don't break you.
 ///
 /// The variants that carry a `String` have already had their context formatted in. Backends
 /// erase their underlying error types into that string rather than keeping them as a
@@ -55,8 +107,8 @@ pub enum Error {
 
     /// The call was rejected before it reached the backend, because the arguments contradict
     /// the configured schema or the operation's contract — an `sk` that disagrees with the
-    /// [`PrimaryIndex`], an `expected_version` of `0`, a sort key condition against an index
-    /// that has no sort key.
+    /// [`PrimaryIndex`], a sort key condition against an index that has no sort key, a counter
+    /// attribute that names a key attribute.
     ///
     /// Always a caller bug: retrying unchanged will fail the same way.
     InvalidRequest(String),
@@ -136,6 +188,7 @@ pub struct KeySchema {
 /// simple primary key (partition key only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrimaryIndex {
+    /// Attribute names of the base table's partition key and, if it has one, sort key.
     pub keys: KeySchema,
 }
 
@@ -291,9 +344,10 @@ impl AnyIndex {
 
 /// The `data_version` a newly created item starts at.
 ///
-/// `0` is below it, and means "stored before versioning existed" (see
-/// [`Container::data_version`]). Passing `0` to [`AwsDynamoDbService::put_item`] upgrades such a
-/// record onto the versioning scheme, landing it here.
+/// `0` is below it, and means "stored before versioning existed": an item written without a
+/// `data_version` attribute, which [`AwsDynamoDbService::get_item`] reports as version `0`.
+/// Passing `0` to [`AwsDynamoDbService::put_item`] upgrades such a record onto the versioning
+/// scheme, landing it here.
 pub const INITIAL_DATA_VERSION: u64 = 1;
 
 /// The stored representation of an item, minus its primary key.
@@ -303,7 +357,7 @@ pub const INITIAL_DATA_VERSION: u64 = 1;
 /// so they deliberately aren't fields on `Container` — that would hardcode fixed attribute
 /// names into every stored item, in tension with `PrimaryIndex` being configurable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Container<T> {
+pub(crate) struct Container<T> {
     /// Data version used for optimistic concurrency control. Must not be renamed.
     /// This will default to zero if the version number is not present on the record
     /// (indicating a legacy record).
@@ -315,11 +369,24 @@ pub struct Container<T> {
     payload: T,
 }
 
+/// The operations every backend provides, over items carrying a `data_version` for optimistic
+/// concurrency control.
+///
+/// Implemented by [`aws::AwsDynamoDb`] against a real table and by [`mock::MockDynamoDb`] in
+/// memory. A shared conformance suite runs the same assertions against both, so behaviour
+/// documented here holds for either — including which [`Error`] variant a given failure produces.
+///
+/// Each implementation is configured with one [`PrimaryIndex`] describing its tables' key
+/// attribute names. Every keyed operation validates `sk` against it: pass `Some` if and only if
+/// that schema has a sort key, or the call fails with [`Error::InvalidRequest`] before reaching
+/// the backend.
+///
+/// See the [crate-level docs](crate) for choosing between the write operations.
 #[async_trait::async_trait]
 pub trait AwsDynamoDbService: Send + Sync {
     /// DynamoDB get_item() operation.
     ///
-    /// Reads the [`Container`] stored under the base table's primary key `(pk, sk)` and, if
+    /// Reads the item stored under the base table's primary key `(pk, sk)` and, if
     /// present, returns the stored `data_version` (for optimistic concurrency control) together
     /// with the deserialized payload.
     ///
@@ -514,7 +581,7 @@ pub trait AwsDynamoDbService: Send + Sync {
     /// DynamoDB Query operation, against the base table or any
     /// [`GlobalSecondaryIndex`]/[`LocalSecondaryIndex`].
     ///
-    /// Returns every [`Container`] stored under partition key `pk` in `index`, narrowed by
+    /// Returns every item stored under partition key `pk` in `index`, narrowed by
     /// `sk_condition` if `Some` (see [`SortKeyCondition`]), or every item under `pk` when
     /// `sk_condition` is `None`. For each matching item the stored `data_version` (for
     /// optimistic concurrency control) is returned together with the deserialized payload. An
@@ -538,7 +605,7 @@ pub trait AwsDynamoDbService: Send + Sync {
 
     /// DynamoDB delete_item() operation.
     ///
-    /// Removes the [`Container`] stored under `(pk, sk)` in `table`. The operation is
+    /// Removes the item stored under `(pk, sk)` in `table`. The operation is
     /// idempotent: deleting a key that does not exist succeeds and is treated as a no-op
     /// (mirroring DynamoDB's DeleteItem semantics).
     ///

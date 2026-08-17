@@ -2,11 +2,14 @@
 name = "pro_dynamo"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
 authors = [ "Alexander Ulmer <ulmer@balu.care>" ]
 description = "High level DynamoDB abstraction"
 repository = "https://github.com/ulmer-a/dynamodb"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
+keywords = [ "dynamodb", "aws", "database", "nosql" ]
+categories = [ "database", "api-bindings" ]
 
 [features]
 default = [ "mock", "aws" ]
