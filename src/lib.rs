@@ -75,6 +75,16 @@ pub enum Error {
 }
 
 impl Error {
+    /// Rejects a counter attribute that would collide with something the backend manages.
+    ///
+    /// Shared so the two backends can't drift on a check they both perform.
+    #[cfg(any(feature = "aws", feature = "mock"))]
+    pub(crate) fn reserved_counter_attribute(attribute: &str, reason: &str) -> Self {
+        Error::InvalidRequest(format!(
+            "add_to_counter() cannot target the attribute {attribute:?}: {reason}"
+        ))
+    }
+
     /// Rejects a [`SortKeyCondition`] against an index that has no sort key.
     ///
     /// Shared so the two backends can't drift on the wording of a check they both perform.
@@ -129,8 +139,38 @@ pub struct PrimaryIndex {
     pub keys: KeySchema,
 }
 
+/// Attribute name [`Container::data_version`] serializes to. Must match the field name.
+#[cfg(any(feature = "aws", feature = "mock"))]
+pub(crate) const DATA_VERSION_ATTRIBUTE: &str = "data_version";
+
 #[cfg(any(feature = "aws", feature = "mock"))]
 impl PrimaryIndex {
+    /// Rejects a counter attribute the backend can't atomically add to: a primary key attribute
+    /// (DynamoDB forbids updating those) or the `data_version` attribute (which
+    /// [`AwsDynamoDbService::add_to_counter`] bumps itself, and two updates can't target one
+    /// path).
+    pub(crate) fn validate_counter_attribute(&self, attribute: &str) -> Result<(), Error> {
+        if attribute == self.keys.pk_identifier {
+            return Err(Error::reserved_counter_attribute(
+                attribute,
+                "it is the table's partition key",
+            ));
+        }
+        if self.keys.sk_identifier.as_deref() == Some(attribute) {
+            return Err(Error::reserved_counter_attribute(
+                attribute,
+                "it is the table's sort key",
+            ));
+        }
+        if attribute == DATA_VERSION_ATTRIBUTE {
+            return Err(Error::reserved_counter_attribute(
+                attribute,
+                "it holds the optimistic-concurrency version",
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolves a caller-supplied `sk` against this schema, returning the sort key's attribute
     /// name paired with the value when the table has one.
     ///
@@ -431,6 +471,45 @@ pub trait AwsDynamoDbService: Send + Sync {
     ) -> Result<u64, Error>
     where
         T: Serialize + Send + Sync;
+
+    /// DynamoDB UpdateItem `ADD`: atomically adds `delta` to a numeric attribute.
+    ///
+    /// Returns the attribute's new value. The add happens server-side in a single request, so
+    /// concurrent callers each get a distinct result and none of them can lose an increment —
+    /// which is what makes this suitable for allocating identifiers. Unlike a
+    /// [`AwsDynamoDbService::get_item`] → [`AwsDynamoDbService::put_item`] loop it never
+    /// conflicts, so it costs one round trip regardless of contention.
+    ///
+    /// Creates the item if the key is absent, treating the counter as having been `0`; a first
+    /// call with `delta` of `1` therefore returns `1`. `delta` may be negative.
+    ///
+    /// The item's `data_version` is bumped by the same request, so a counter item stays
+    /// versioned like any other and an unversioned one is upgraded onto the scheme by its first
+    /// increment. Every other attribute is left alone: this is an update, not the wholesale
+    /// replacement that [`AwsDynamoDbService::put_item`] performs, so a counter can live on an
+    /// item that also carries a payload.
+    ///
+    /// Note the trade-off against `put_item`: an `ADD` cannot be conditioned on the value it is
+    /// changing, so a caller that must *decide* based on the current value — clamp at a limit,
+    /// reject an overdraft — still needs the compare-and-swap loop.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] if `counter_attribute` is a primary key attribute or
+    /// `data_version`, or if `sk` is not `Some` exactly when the implementation's configured
+    /// [`PrimaryIndex`] has a sort key.
+    ///
+    /// [`Error::Service`] if the backend fails — including when the stored attribute exists but
+    /// isn't a number, which DynamoDB rejects as a malformed update rather than a conflict.
+    /// Never [`Error::Conflict`]: there is no condition to lose.
+    async fn add_to_counter(
+        &self,
+        pk: String,
+        sk: Option<String>,
+        table: &str,
+        counter_attribute: &str,
+        delta: i64,
+    ) -> Result<i64, Error>;
 
     /// DynamoDB Query operation, against the base table or any
     /// [`GlobalSecondaryIndex`]/[`LocalSecondaryIndex`].

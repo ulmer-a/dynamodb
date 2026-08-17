@@ -231,6 +231,59 @@ impl AwsDynamoDbService for MockDynamoDb {
         Ok(new_version)
     }
 
+    async fn add_to_counter(
+        &self,
+        pk: String,
+        sk: Option<String>,
+        table: &str,
+        counter_attribute: &str,
+        delta: i64,
+    ) -> Result<i64, Error> {
+        self.primary_index
+            .validate_counter_attribute(counter_attribute)?;
+        self.primary_index.resolve_sk(&sk)?;
+
+        let mut guard = self
+            .items
+            .lock()
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?;
+
+        // DynamoDB's ADD creates the item when the key is absent, treating every attribute it
+        // touches as having been 0. The whole read-modify-write happens under the store's lock,
+        // which is how the mock gets the atomicity a single UpdateItem gives the AWS backend.
+        let (version, value) = guard
+            .entry(MockDbKey {
+                table_name: table.to_string(),
+                pk: pk.clone(),
+                sk,
+            })
+            .or_insert_with(|| (0, serde_json::Value::Object(serde_json::Map::new())));
+
+        let Some(object) = value.as_object_mut() else {
+            return Err(Error::Service(format!(
+                "Stored mock item for pk={pk} is not an object, so {counter_attribute:?} cannot \
+                 be added to"
+            )));
+        };
+
+        let current = match object.get(counter_attribute) {
+            None => 0,
+            Some(existing) => existing.as_i64().ok_or_else(|| {
+                // DynamoDB rejects an ADD against a non-numeric attribute as a malformed
+                // update, which surfaces as Error::Service — matched here so both backends
+                // report it the same way.
+                Error::Service(format!(
+                    "Counter {counter_attribute:?} for pk={pk} is not a number: {existing}"
+                ))
+            })?,
+        };
+
+        let new_value = current + delta;
+        object.insert(counter_attribute.to_string(), new_value.into());
+        *version += 1;
+        Ok(new_value)
+    }
+
     async fn query_items<T>(
         &self,
         index: impl Into<AnyIndex> + Send,

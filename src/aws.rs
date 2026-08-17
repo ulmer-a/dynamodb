@@ -1,16 +1,13 @@
 use std::collections::HashMap;
 
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    AnyIndex, AwsDynamoDbService, Container, Error, INITIAL_DATA_VERSION, PrimaryIndex,
-    SortKeyCondition,
+    AnyIndex, AwsDynamoDbService, Container, DATA_VERSION_ATTRIBUTE, Error, INITIAL_DATA_VERSION,
+    PrimaryIndex, SortKeyCondition,
 };
-
-/// Attribute name [`Container::data_version`] serializes to. Must match the field name.
-const DATA_VERSION_ATTRIBUTE: &str = "data_version";
 
 /// How many times [`AwsDynamoDbService::put_item_unconditional`] will re-read and retry before
 /// giving up.
@@ -348,6 +345,64 @@ impl AwsDynamoDbService for AwsDynamoDb {
         .await?;
 
         Ok(new_version)
+    }
+
+    async fn add_to_counter(
+        &self,
+        pk: String,
+        sk: Option<String>,
+        table: &str,
+        counter_attribute: &str,
+        delta: i64,
+    ) -> Result<i64, Error> {
+        self.primary_index
+            .validate_counter_attribute(counter_attribute)?;
+        let sk_attr = self.resolve_sk(&sk)?;
+
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(table)
+            .key(
+                self.primary_index.keys.pk_identifier.as_str(),
+                AttributeValue::S(pk.clone()),
+            )
+            // ADD treats a missing attribute as 0, so this both creates the item when the key is
+            // absent and upgrades an unversioned one: data_version lands on INITIAL_DATA_VERSION
+            // either way. Bumping it in the same request keeps it monotonic without a read.
+            .update_expression("ADD #counter :delta, #version :one")
+            .expression_attribute_names("#counter", counter_attribute)
+            .expression_attribute_names("#version", DATA_VERSION_ATTRIBUTE)
+            .expression_attribute_values(":delta", AttributeValue::N(delta.to_string()))
+            .expression_attribute_values(
+                ":one",
+                AttributeValue::N(INITIAL_DATA_VERSION.to_string()),
+            )
+            .return_values(ReturnValue::UpdatedNew);
+        if let Some((sk_identifier, sk_value)) = sk_attr {
+            request = request.key(sk_identifier, AttributeValue::S(sk_value));
+        }
+
+        let result = request.send().await.map_err(|e| {
+            Error::Service(format!(
+                "DynamoDB UpdateItem failed for pk={pk}, sk={sk:?}: {}",
+                e.into_service_error()
+            ))
+        })?;
+
+        // UPDATED_NEW returns exactly the attributes this expression touched.
+        let attributes = result.attributes.unwrap_or_default();
+        match attributes.get(counter_attribute) {
+            Some(AttributeValue::N(n)) => n.parse::<i64>().map_err(|e| {
+                Error::Serialization(format!(
+                    "Counter {counter_attribute:?} for pk={pk} is not an i64: {e}"
+                ))
+            }),
+            other => Err(Error::Service(format!(
+                "DynamoDB UpdateItem did not return a numeric {counter_attribute:?} for pk={pk}: \
+                 {other:?}"
+            ))),
+        }
     }
 
     async fn query_items<T>(

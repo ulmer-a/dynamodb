@@ -58,6 +58,20 @@ pub(crate) struct Payload {
     count: u32,
 }
 
+/// A bare counter item, as `add_to_counter` leaves it when it creates the key itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Counter {
+    next: i64,
+}
+
+/// A payload that also carries a counter, to check that an increment merges rather than replaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PayloadWithCounter {
+    name: String,
+    count: u32,
+    hits: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PayloadWithGsi {
     gsi1pk: String,
@@ -548,6 +562,209 @@ pub(crate) async fn repeated_unconditional_writes_keep_advancing_the_version<H: 
 }
 
 // ---------------------------------------------------------------------------------------------
+// add_to_counter
+// ---------------------------------------------------------------------------------------------
+
+pub(crate) async fn add_to_counter_creates_the_item_and_returns_the_new_value<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("counter#catalogue", Some("METADATA"));
+
+    let allocated =
+        f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 1)
+            .await
+            .unwrap();
+
+    // A missing attribute counts as 0, so the first increment yields 1.
+    assert_eq!(allocated, 1);
+    let stored: Option<(u64, Counter)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(stored, Some((INITIAL_DATA_VERSION, Counter { next: 1 })));
+}
+
+/// The allocator case: every call hands back a distinct, increasing number, and nothing is lost.
+pub(crate) async fn add_to_counter_allocates_distinct_increasing_values<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("counter#catalogue", Some("METADATA"));
+
+    let mut allocated = Vec::new();
+    for _ in 0..5 {
+        allocated.push(
+            f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 1)
+                .await
+                .unwrap(),
+        );
+    }
+
+    assert_eq!(allocated, vec![1, 2, 3, 4, 5]);
+    let stored: Option<(u64, Counter)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    // Each increment is also a write, so the version tracks the number of allocations.
+    assert_eq!(stored, Some((5, Counter { next: 5 })));
+}
+
+/// The reason this operation exists: increments that overlap in flight still each get their own
+/// number, with none lost and none handed out twice.
+///
+/// A `get_item` → `put_item` loop would have to retry its way through this; an `ADD` resolves it
+/// server-side in one round trip per caller.
+pub(crate) async fn concurrent_counter_increments_all_get_distinct_values<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("counter#catalogue", Some("METADATA"));
+    let allocate = || {
+        f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 1)
+    };
+
+    // Started together and awaited together, so the requests genuinely overlap.
+    let (a, b, c, d, e, g, i, j) = tokio::join!(
+        allocate(),
+        allocate(),
+        allocate(),
+        allocate(),
+        allocate(),
+        allocate(),
+        allocate(),
+        allocate(),
+    );
+
+    let mut allocated = [a, b, c, d, e, g, i, j]
+        .into_iter()
+        .map(|result| result.unwrap())
+        .collect::<Vec<_>>();
+    allocated.sort_unstable();
+    assert_eq!(
+        allocated,
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        "every caller must get a distinct number, with none skipped"
+    );
+
+    let stored: Option<(u64, Counter)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(stored, Some((8, Counter { next: 8 })));
+}
+
+pub(crate) async fn add_to_counter_accepts_a_negative_delta<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("counter#stock", Some("METADATA"));
+
+    f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 10)
+        .await
+        .unwrap();
+    let after =
+        f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", -4)
+            .await
+            .unwrap();
+
+    assert_eq!(after, 6);
+}
+
+/// An update, not a replacement: a counter can live on an item that also carries a payload.
+pub(crate) async fn add_to_counter_leaves_other_attributes_untouched<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    f.db.create_item(
+        pk.clone(),
+        sk.clone(),
+        &f.table,
+        &Payload {
+            name: "balu".to_string(),
+            count: 7,
+        },
+    )
+    .await
+    .unwrap();
+
+    let hits =
+        f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "hits", 3)
+            .await
+            .unwrap();
+
+    assert_eq!(hits, 3);
+    let stored: Option<(u64, PayloadWithCounter)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(
+        stored,
+        Some((
+            2,
+            PayloadWithCounter {
+                name: "balu".to_string(),
+                count: 7,
+                hits: 3,
+            }
+        )),
+        "the payload must survive, and the version must advance"
+    );
+}
+
+/// The counter's version bump has to keep `data_version` usable as a CAS token.
+pub(crate) async fn add_to_counter_advances_the_data_version<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("counter#catalogue", Some("METADATA"));
+    f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 1)
+        .await
+        .unwrap();
+
+    // A caller holding version 1 loses its swap once the counter moves on.
+    f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 1)
+        .await
+        .unwrap();
+    let err =
+        f.db.put_item(
+            pk.clone(),
+            sk.clone(),
+            &f.table,
+            INITIAL_DATA_VERSION,
+            &Counter { next: 99 },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+
+    // ...and the current version still works.
+    let next =
+        f.db.put_item(pk, sk, &f.table, 2, &Counter { next: 99 })
+            .await
+            .unwrap();
+    assert_eq!(next, 3);
+}
+
+pub(crate) async fn add_to_counter_rejects_reserved_attributes<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("counter#catalogue", Some("METADATA"));
+
+    // The backend manages data_version itself, and DynamoDB forbids updating key attributes.
+    for reserved in ["data_version", "pk", "sk"] {
+        let err =
+            f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, reserved, 1)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRequest(_)),
+            "{reserved}: {err:?}"
+        );
+    }
+}
+
+/// Adding to an attribute that exists but isn't a number is a malformed update, not a conflict.
+pub(crate) async fn add_to_counter_rejects_a_non_numeric_attribute<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    f.db.create_item(
+        pk.clone(),
+        sk.clone(),
+        &f.table,
+        &Payload {
+            name: "balu".to_string(),
+            count: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let err =
+        f.db.add_to_counter(pk, sk, &f.table, "name", 1)
+            .await
+            .unwrap_err();
+
+    assert!(matches!(err, Error::Service(_)), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
 // query_items
 // ---------------------------------------------------------------------------------------------
 
@@ -925,6 +1142,11 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
             .unwrap_err(),
     );
     missing(
+        f.db.add_to_counter("device#1".to_string(), None, &f.table, "next", 1)
+            .await
+            .unwrap_err(),
+    );
+    missing(
         f.db.put_item_unconditional("device#1".to_string(), None, &f.table, &payload)
             .await
             .unwrap_err(),
@@ -957,6 +1179,11 @@ pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h
     );
     unexpected(
         f.db.create_item(pk.clone(), sk.clone(), &f.table, &payload)
+            .await
+            .unwrap_err(),
+    );
+    unexpected(
+        f.db.add_to_counter(pk.clone(), sk.clone(), &f.table, "next", 1)
             .await
             .unwrap_err(),
     );
@@ -1112,6 +1339,14 @@ macro_rules! conformance_suite {
             put_item_unconditional_creates_item_with_version_one,
             put_item_unconditional_overwrites_and_advances_version,
             repeated_unconditional_writes_keep_advancing_the_version,
+            add_to_counter_creates_the_item_and_returns_the_new_value,
+            add_to_counter_allocates_distinct_increasing_values,
+            concurrent_counter_increments_all_get_distinct_values,
+            add_to_counter_accepts_a_negative_delta,
+            add_to_counter_leaves_other_attributes_untouched,
+            add_to_counter_advances_the_data_version,
+            add_to_counter_rejects_reserved_attributes,
+            add_to_counter_rejects_a_non_numeric_attribute,
             query_items_returns_matching_items_sorted_by_sort_key,
             query_items_excludes_non_matching_keys,
             query_items_returns_empty_when_no_match,
