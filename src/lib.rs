@@ -262,8 +262,7 @@ impl AnyIndex {
 ///
 /// `0` is reserved: it's what a record written before versioning existed reads back as (see
 /// [`Container::data_version`]), and [`AwsDynamoDbService::put_item`] rejects it.
-#[cfg(any(feature = "aws", feature = "mock"))]
-pub(crate) const INITIAL_DATA_VERSION: u64 = 1;
+pub const INITIAL_DATA_VERSION: u64 = 1;
 
 /// The stored representation of an item, minus its primary key.
 ///
@@ -357,28 +356,43 @@ pub trait AwsDynamoDbService: Send + Sync {
     where
         T: Serialize + Send + Sync;
 
-    /// DynamoDB put_item() operation without optimistic concurrency control.
+    /// Last-writer-wins write, with no expectation about the item's current contents.
     ///
-    /// Unconditionally writes `payload` under `(pk, sk)` in `table`, overwriting whatever item
-    /// is currently stored (if any) and ignoring any existing `data_version`. The stored
-    /// `data_version` is reset to `1`.
+    /// Writes `payload` under `(pk, sk)` in `table`, overwriting whatever item is currently
+    /// stored (if any), and returns the new `data_version`.
     ///
-    /// Use this only for writes where last-writer-wins is acceptable; prefer
-    /// [`AwsDynamoDbService::put_item`] when concurrent writers must not clobber each other.
+    /// The version *advances*: one past whatever was stored, or [`INITIAL_DATA_VERSION`] if the
+    /// key was absent. It is never rewound, so a `data_version` a caller has already spent can
+    /// never become valid again. Achieving that costs a read — implementations are not required
+    /// to do this in a single round trip, and the AWS backend does not.
+    ///
+    /// # Deprecated
+    ///
+    /// Prefer [`AwsDynamoDbService::create_item`] to bootstrap an item and
+    /// [`AwsDynamoDbService::put_item`] to update one. Between them they cover every case
+    /// safely, and both tell the caller when they lost a race — this operation, by design,
+    /// cannot. It remains the only way to write a record stored without a `data_version`.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidRequest`] if `sk` is not `Some` exactly when the implementation's
     /// configured [`PrimaryIndex`] has a sort key, [`Error::Serialization`] if `payload` doesn't
-    /// serialize, [`Error::Service`] if the backend fails. Never [`Error::Conflict`] — this
-    /// operation has no condition to fail.
+    /// serialize, [`Error::Service`] if the backend fails.
+    ///
+    /// [`Error::Conflict`] if sustained contention on the key exhausts the implementation's
+    /// retry budget. Nothing is written in that case; the operation is safe to retry.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use create_item() to bootstrap an item and put_item() to update one; both \
+                report a lost race, which this operation cannot"
+    )]
     async fn put_item_unconditional<T>(
         &self,
         pk: String,
         sk: Option<String>,
         table: &str,
         payload: &T,
-    ) -> Result<(), Error>
+    ) -> Result<u64, Error>
     where
         T: Serialize + Send + Sync;
 

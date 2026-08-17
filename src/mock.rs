@@ -155,7 +155,7 @@ impl AwsDynamoDbService for MockDynamoDb {
         sk: Option<String>,
         table: &str,
         payload: &T,
-    ) -> Result<(), Error>
+    ) -> Result<u64, Error>
     where
         T: Serialize + Send + Sync,
     {
@@ -164,19 +164,25 @@ impl AwsDynamoDbService for MockDynamoDb {
         let value = serde_json::to_value(payload)
             .map_err(|e| Error::Serialization(format!("Failed to serialize mock payload: {e}")))?;
 
-        // Last-writer-wins: overwrite any existing item and reset the version to 1.
-        self.items
+        let mut guard = self
+            .items
             .lock()
-            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?
-            .insert(
-                MockDbKey {
-                    table_name: table.to_string(),
-                    pk,
-                    sk,
-                },
-                (INITIAL_DATA_VERSION, value),
-            );
-        Ok(())
+            .map_err(|e| Error::Service(format!("mock store lock poisoned: {e}")))?;
+
+        let map_key = MockDbKey {
+            table_name: table.to_string(),
+            pk,
+            sk,
+        };
+
+        // Last-writer-wins on the payload, but the version still advances: rewinding it would
+        // make a spent version token valid again. The whole read-modify-write happens under the
+        // store's lock, so unlike the AWS backend there's no window to retry around.
+        let new_version = guard
+            .get(&map_key)
+            .map_or(INITIAL_DATA_VERSION, |(version, _)| version + 1);
+        guard.insert(map_key, (new_version, value));
+        Ok(new_version)
     }
 
     async fn put_item<T>(
@@ -449,8 +455,26 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::AlreadyExists { .. }), "{err:?}");
 
+        let result: Option<(u64, Payload)> = db
+            .get_item(pk.clone(), sk.clone(), "BaluCoreTable")
+            .await
+            .unwrap();
+        assert_eq!(result, Some((0, payload.clone())));
+
+        // put_item_unconditional is the one operation that can write it, and doing so advances
+        // the version off 0, upgrading the record onto the versioning scheme.
+        #[allow(
+            deprecated,
+            reason = "the deprecated operation is the only writer for legacy records"
+        )]
+        let version = db
+            .put_item_unconditional(pk.clone(), sk.clone(), "BaluCoreTable", &payload)
+            .await
+            .unwrap();
+        assert_eq!(version, INITIAL_DATA_VERSION);
+
         let result: Option<(u64, Payload)> = db.get_item(pk, sk, "BaluCoreTable").await.unwrap();
-        assert_eq!(result, Some((0, payload)));
+        assert_eq!(result, Some((1, payload)));
     }
 
     #[tokio::test]

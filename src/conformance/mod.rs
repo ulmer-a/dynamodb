@@ -21,8 +21,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AwsDynamoDbService, Error, GlobalSecondaryIndex, KeySchema, LocalSecondaryIndex, PrimaryIndex,
-    SortKeyCondition,
+    AwsDynamoDbService, Error, GlobalSecondaryIndex, INITIAL_DATA_VERSION, KeySchema,
+    LocalSecondaryIndex, PrimaryIndex, SortKeyCondition,
 };
 
 #[cfg(feature = "dynamodb-local-tests")]
@@ -142,7 +142,7 @@ where
     assert!(version >= 1, "seed() cannot produce data_version {version}");
 
     let (pk, sk) = key(pk, sk);
-    db.put_item_unconditional(pk.clone(), sk.clone(), table, payload)
+    db.create_item(pk.clone(), sk.clone(), table, payload)
         .await
         .expect("seed: initial write failed");
 
@@ -421,6 +421,10 @@ pub(crate) async fn put_item_cannot_create_a_missing_item<H: Harness>(h: &H) {
 // put_item_unconditional
 // ---------------------------------------------------------------------------------------------
 
+#[allow(
+    deprecated,
+    reason = "exercising the deprecated operation is the point of this test"
+)]
 pub(crate) async fn put_item_unconditional_creates_item_with_version_one<H: Harness>(h: &H) {
     let f = h.setup(composite_key()).await;
     let (pk, sk) = key("device#1", Some("METADATA"));
@@ -429,15 +433,21 @@ pub(crate) async fn put_item_unconditional_creates_item_with_version_one<H: Harn
         count: 1,
     };
 
-    f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)
-        .await
-        .unwrap();
+    let version =
+        f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)
+            .await
+            .unwrap();
 
+    assert_eq!(version, INITIAL_DATA_VERSION);
     let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
     assert_eq!(result, Some((1, payload)));
 }
 
-pub(crate) async fn put_item_unconditional_overwrites_and_resets_version<H: Harness>(h: &H) {
+#[allow(
+    deprecated,
+    reason = "exercising the deprecated operation is the point of this test"
+)]
+pub(crate) async fn put_item_unconditional_overwrites_and_advances_version<H: Harness>(h: &H) {
     let f = h.setup(composite_key()).await;
     let (pk, sk) = key("device#1", Some("METADATA"));
     seed(
@@ -457,14 +467,41 @@ pub(crate) async fn put_item_unconditional_overwrites_and_resets_version<H: Harn
         count: 2,
     };
 
-    f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &updated)
-        .await
-        .unwrap();
+    let version =
+        f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &updated)
+            .await
+            .unwrap();
 
-    // The pre-existing version is ignored and reset to 1 on an unconditional write. See
-    // `unconditional_write_revives_a_stale_version_token` for why that's a hazard.
+    // The payload is replaced wholesale, but the version moves forward from what was stored
+    // rather than being reset.
+    assert_eq!(version, 5);
     let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
-    assert_eq!(result, Some((1, updated)));
+    assert_eq!(result, Some((5, updated)));
+}
+
+/// Repeated unconditional writes must keep climbing, never plateau or reset.
+#[allow(
+    deprecated,
+    reason = "exercising the deprecated operation is the point of this test"
+)]
+pub(crate) async fn repeated_unconditional_writes_keep_advancing_the_version<H: Harness>(h: &H) {
+    let f = h.setup(composite_key()).await;
+    let (pk, sk) = key("device#1", Some("METADATA"));
+    let payload = Payload {
+        name: "balu".to_string(),
+        count: 1,
+    };
+
+    for expected in 1..=4 {
+        let version =
+            f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)
+                .await
+                .unwrap();
+        assert_eq!(version, expected);
+    }
+
+    let result: Option<(u64, Payload)> = f.db.get_item(pk, sk, &f.table).await.unwrap();
+    assert_eq!(result, Some((4, payload)));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -780,9 +817,11 @@ pub(crate) async fn partition_only_primary_key_round_trip<H: Harness>(h: &H) {
         count: 1,
     };
 
-    f.db.put_item_unconditional("device#1".to_string(), None, &f.table, &payload)
-        .await
-        .unwrap();
+    let version =
+        f.db.create_item("device#1".to_string(), None, &f.table, &payload)
+            .await
+            .unwrap();
+    assert_eq!(version, INITIAL_DATA_VERSION);
 
     let result: Option<(u64, Payload)> =
         f.db.get_item("device#1".to_string(), None, &f.table)
@@ -813,6 +852,10 @@ pub(crate) async fn partition_only_primary_key_round_trip<H: Harness>(h: &H) {
 
 /// Every keyed operation must reject an `sk` argument that disagrees with the configured
 /// [`PrimaryIndex`], in both directions.
+#[allow(
+    deprecated,
+    reason = "the deprecated operation must validate keys like the others"
+)]
 pub(crate) async fn operations_reject_sort_key_not_matching_schema<H: Harness>(h: &H) {
     let payload = Payload {
         name: "balu".to_string(),
@@ -953,19 +996,19 @@ pub(crate) async fn concurrent_bootstrap_is_rejected_for_the_loser<H: Harness>(h
 }
 
 // ---------------------------------------------------------------------------------------------
-// Known defects
-//
-// The test below asserts behaviour that is WRONG. It exists to pin a bug the roadmap is about,
-// so that the fix is visible as a test change rather than landing silently, and names the phase
-// that must invert it.
+// Version monotonicity
 // ---------------------------------------------------------------------------------------------
 
-/// `put_item_unconditional` resets `data_version` to 1 instead of advancing it, so a version
-/// token that has already been spent becomes valid again — a textbook ABA.
+/// A `data_version` that has already been spent must never become valid again.
 ///
-/// INVERT IN PHASE 3: `data_version` must be monotonic per key, so the stale CAS at the end
-/// must fail.
-pub(crate) async fn unconditional_write_revives_a_stale_version_token<H: Harness>(h: &H) {
+/// `put_item_unconditional` used to reset the version to 1 rather than advancing it, which
+/// revived spent compare-and-swap tokens — a textbook ABA. A CAS token is only meaningful if it
+/// is monotonic per key.
+#[allow(
+    deprecated,
+    reason = "exercising the deprecated operation is the point of this test"
+)]
+pub(crate) async fn unconditional_write_does_not_revive_a_stale_version_token<H: Harness>(h: &H) {
     let f = h.setup(composite_key()).await;
     let (pk, sk) = key("device#1", Some("METADATA"));
     let payload = Payload {
@@ -987,19 +1030,19 @@ pub(crate) async fn unconditional_write_revives_a_stale_version_token<H: Harness
             .unwrap_err();
     assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
 
-    // An unconditional write rewinds the version to 1...
-    f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)
-        .await
-        .unwrap();
+    // An unconditional write advances the version rather than rewinding it...
+    let after_unconditional =
+        f.db.put_item_unconditional(pk.clone(), sk.clone(), &f.table, &payload)
+            .await
+            .unwrap();
+    assert_eq!(after_unconditional, 3);
 
-    // ...and the spent token now CASes successfully against a different generation of the item.
-    let revived =
+    // ...so the spent token stays spent.
+    let err =
         f.db.put_item(pk, sk, &f.table, held_version, &payload)
-            .await;
-    assert!(
-        revived.is_ok(),
-        "known defect: a spent version token must not become valid again, got {revived:?}"
-    );
+            .await
+            .unwrap_err();
+    assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
 }
 
 /// Generates a `#[tokio::test]` per conformance test, bound to `$harness`.
@@ -1023,7 +1066,8 @@ macro_rules! conformance_suite {
             put_item_rejects_expected_version_zero,
             put_item_cannot_create_a_missing_item,
             put_item_unconditional_creates_item_with_version_one,
-            put_item_unconditional_overwrites_and_resets_version,
+            put_item_unconditional_overwrites_and_advances_version,
+            repeated_unconditional_writes_keep_advancing_the_version,
             query_items_returns_matching_items_sorted_by_sort_key,
             query_items_excludes_non_matching_keys,
             query_items_returns_empty_when_no_match,
@@ -1038,7 +1082,7 @@ macro_rules! conformance_suite {
             partition_only_primary_key_round_trip,
             operations_reject_sort_key_not_matching_schema,
             concurrent_bootstrap_is_rejected_for_the_loser,
-            unconditional_write_revives_a_stale_version_token,
+            unconditional_write_does_not_revive_a_stale_version_token,
         );
     };
     (@cases $harness:expr; $($name:ident),* $(,)?) => {

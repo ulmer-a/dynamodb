@@ -133,27 +133,32 @@ async fn create_table(client: &aws_sdk_dynamodb::Client, table: &str, keys: &Key
     });
 }
 
+/// A client pointed at the local instance.
+async fn client() -> aws_sdk_dynamodb::Client {
+    let endpoint =
+        std::env::var("DYNAMODB_LOCAL_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(endpoint)
+        .region(aws_config::Region::new("local"))
+        .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+            "local",
+            "local",
+            None,
+            None,
+            "conformance",
+        ))
+        .load()
+        .await;
+
+    aws_sdk_dynamodb::Client::new(&config)
+}
+
 impl Harness for DynamoDbLocalHarness {
     type Db = AwsDynamoDb;
 
     async fn setup(&self, keys: KeySchema) -> Fixture<Self::Db> {
-        let endpoint = std::env::var("DYNAMODB_LOCAL_ENDPOINT")
-            .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .endpoint_url(endpoint)
-            .region(aws_config::Region::new("local"))
-            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
-                "local",
-                "local",
-                None,
-                None,
-                "conformance",
-            ))
-            .load()
-            .await;
-
-        let client = aws_sdk_dynamodb::Client::new(&config);
+        let client = client().await;
         let table = unique_table_name();
         let other_table = unique_table_name();
         create_table(&client, &table, &keys).await;
@@ -168,3 +173,86 @@ impl Harness for DynamoDbLocalHarness {
 }
 
 crate::conformance::conformance_suite!(DynamoDbLocalHarness);
+
+/// A record written before versioning existed carries no `data_version` attribute at all, and
+/// DynamoDB evaluates a comparison against an absent attribute as false — so the compare-and-swap
+/// inside `put_item_unconditional` has to match version 0 by absence rather than by equality.
+///
+/// This can't live in the shared conformance suite: the trait offers no way to produce an
+/// unversioned item, so seeding one needs raw SDK access. It matters because
+/// `put_item_unconditional` is currently the *only* operation that can write such a record —
+/// `put_item` rejects version 0 and `create_item` refuses an existing item. If the condition were
+/// wrong, every retry would fail and legacy records would become unwritable.
+#[allow(
+    deprecated,
+    reason = "the deprecated operation is the only writer for legacy records"
+)]
+#[tokio::test]
+async fn put_item_unconditional_can_write_a_legacy_record() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use serde::{Deserialize, Serialize};
+
+    use crate::AwsDynamoDbService;
+    use crate::conformance::{composite_key, primary_index};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Payload {
+        name: String,
+    }
+
+    let client = client().await;
+    let table = unique_table_name();
+    let keys = composite_key();
+    create_table(&client, &table, &keys).await;
+
+    // Seed an item the way a pre-versioning writer would have: no data_version attribute.
+    client
+        .put_item()
+        .table_name(&table)
+        .item("pk", AttributeValue::S("device#legacy".to_string()))
+        .item("sk", AttributeValue::S("METADATA".to_string()))
+        .item("name", AttributeValue::S("legacy".to_string()))
+        .send()
+        .await
+        .expect("failed to seed legacy item");
+
+    let db = AwsDynamoDb::from_client(client, primary_index(keys));
+    let (pk, sk) = ("device#legacy".to_string(), Some("METADATA".to_string()));
+
+    // It reads back as version 0, the documented stand-in for "unversioned".
+    let stored: Option<(u64, Payload)> = db.get_item(pk.clone(), sk.clone(), &table).await.unwrap();
+    assert_eq!(
+        stored,
+        Some((
+            0,
+            Payload {
+                name: "legacy".to_string()
+            }
+        ))
+    );
+
+    // And it can be written, which upgrades it onto the versioning scheme.
+    let version = db
+        .put_item_unconditional(
+            pk.clone(),
+            sk.clone(),
+            &table,
+            &Payload {
+                name: "upgraded".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(version, 1);
+
+    let stored: Option<(u64, Payload)> = db.get_item(pk, sk, &table).await.unwrap();
+    assert_eq!(
+        stored,
+        Some((
+            1,
+            Payload {
+                name: "upgraded".to_string()
+            }
+        ))
+    );
+}
